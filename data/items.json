@@ -1,0 +1,51 @@
+{
+  "schema_version": 2,
+  "categories": {
+    "Rifles": {
+      "AK-47": {
+        "def_index": 7,
+        "paints": [
+          { "name": "Asiimov",     "kit": 44,  "rarity": "covert",     "finish_quality_min": 0.00, "max": 0.80 },
+          { "name": "Redline",     "kit": 282, "rarity": "classified", "finish_quality_min": 0.10, "max": 0.70 },
+          { "name": "Vulcan",      "kit": 302, "rarity": "covert",     "finish_quality_min": 0.00, "max": 0.90 }
+        ]
+      },
+      "M4A4": {
+        "def_index": 16,
+        "paints": [
+          { "name": "Howl",        "kit": 309, "rarity": "contraband", "finish_quality_min": 0.00, "max": 0.80 },
+          { "name": "Asiimov",     "kit": 255, "rarity": "covert",     "finish_quality_min": 0.18, "max": 1.00 }
+        ]
+      },
+      "AWP": {
+        "def_index": 9,
+        "paints": [
+          { "name": "Dragon Lore", "kit": 344, "rarity": "covert",     "finish_quality_min": 0.00, "max": 0.70 },
+          { "name": "Asiimov",     "kit": 279, "rarity": "covert",     "finish_quality_min": 0.18, "max": 1.00 }
+        ]
+      }
+    },
+    "Pistols": {
+      "Desert Eagle": {
+        "def_index": 1,
+        "paints": [
+          { "name": "Blaze",       "kit": 141, "rarity": "restricted", "finish_quality_min": 0.00, "max": 0.08 }
+        ]
+      }
+    },
+    "Knives": {
+      "Karambit": {
+        "def_index": 507,
+        "paints": [
+          { "name": "Fade",        "kit": 38,  "rarity": "exceedingly_rare", "finish_quality_min": 0.00, "max": 0.08 },
+          { "name": "Doppler",     "kit": 416, "rarity": "exceedingly_rare", "finish_quality_min": 0.00, "max": 0.08 }
+        ]
+      }
+    }
+  },
+  "Stickers":  { },
+  "Charms":    { },
+  "Agents":    { },
+  "Cases":     { },
+  "Keys":      { }
+}
