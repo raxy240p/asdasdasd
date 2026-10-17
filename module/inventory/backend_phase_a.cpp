@@ -219,14 +219,33 @@ void ResolveAttrFn() {
         cheat::opsec::MakeGateToClient(reinterpret_cast<void*>(fn)));
 }
 
+// Sanity-check that a Vec* really looks like Source2 CUtlVector / the
+// front-24-bytes of CNetworkUtlVectorBase. A future schema change that
+// inserts anything before the vector would make our in-place walker read
+// a garbage pointer and iterate `size` on it. Rather than casting blind,
+// reject layouts whose fields don't pass basic plausibility.
+bool VecLooksSane(const Vec* v) {
+    if (!v) return false;
+    const auto p = reinterpret_cast<std::uintptr_t>(v->memory);
+    if (v->size < 0 || v->size > 65535)            return false;
+    if (v->allocCount < v->size)                   return false;
+    if (v->allocCount > (1 << 20))                 return false; // 1M caps
+    if (v->size > 0) {
+        if (p < 0x10000 || (p & 0x7))              return false;
+        if (!v->memory)                            return false;
+    }
+    return true;
+}
+
 // Walk CAttributeList.m_Attributes directly; update existing entry if the
-// def-index already lives there. Returns true on in-place update.
+// def-index already lives there. Returns true on in-place update. Bails
+// cleanly (returns false) on a schema break so the gated append fn can
+// take over without the walker chewing garbage memory first.
 bool UpdateExistingAttr(void* attrList, std::uint16_t defIdx, float value) {
     if (!attrList) return false;
-    // The CNetworkUtlVectorBase<CEconItemAttribute> starts at
-    // AttrList_m_Attributes; its first 24 bytes mirror CUtlVector layout.
     auto* v = At<Vec>(attrList, offsets::AttrList_m_Attributes);
-    if (!v || !v->memory || v->size <= 0) return false;
+    if (!VecLooksSane(v))               return false;
+    if (!v->memory || v->size <= 0)     return false;
     auto* arr = reinterpret_cast<std::uint8_t*>(v->memory);
     for (int i = 0; i < v->size; ++i) {
         auto* ent = arr + i * offsets::Attr_sizeof;
@@ -349,7 +368,11 @@ public:
         auto* svc        = WeaponServices(pawn);  if (!svc)        return false;
 
         Vec* myWeapons = At<Vec>(svc, offsets::m_hMyWeapons);
-        if (!myWeapons || !myWeapons->memory || myWeapons->size <= 0) return false;
+        // Same plausibility fence as UpdateExistingAttr. If a future schema
+        // change moves the vector, we bail cleanly instead of iterating a
+        // bogus handle array.
+        if (!VecLooksSane(myWeapons))                       return false;
+        if (!myWeapons->memory || myWeapons->size <= 0)     return false;
 
         auto* handles = static_cast<std::uint32_t*>(myWeapons->memory);
         bool anyApplied = false;
@@ -375,7 +398,8 @@ public:
         auto* svc        = WeaponServices(pawn);  if (!svc)        return false;
 
         Vec* myWeapons = At<Vec>(svc, offsets::m_hMyWeapons);
-        if (!myWeapons || !myWeapons->memory || myWeapons->size <= 0) return false;
+        if (!VecLooksSane(myWeapons))                       return false;
+        if (!myWeapons->memory || myWeapons->size <= 0)     return false;
 
         auto* handles = static_cast<std::uint32_t*>(myWeapons->memory);
         for (int i = 0; i < myWeapons->size; ++i) {
