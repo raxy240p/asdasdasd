@@ -11,12 +11,26 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# No PDB path leak, deterministic timestamps are opted OUT per §3.1 ("/Brepro OFF").
+# Project-wide defines (so UNICODE/_UNICODE reaches ImGui + wWinMain CRT entry).
+add_definitions(-DNOMINMAX -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS
+                -DUNICODE -D_UNICODE)
+
 if (MSVC)
-    add_compile_options(/W4 /permissive- /utf-8 /EHsc /MP)
-    add_link_options(/PDBALTPATH:%_PDB%)
-    add_definitions(-DNOMINMAX -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS)
+    # /utf-8 /EHsc /MP are safe globally. /W4 /permissive- are scoped later
+    # to our own targets so FetchContent'd third-party code (ImGui) stays
+    # quiet under its own warning expectations.
+    add_compile_options(/utf-8 /EHsc /MP)
+    # PDBALTPATH only matters when a PDB is produced.
+    add_link_options($<$<CONFIG:Debug>:/PDBALTPATH:%_PDB%>)
+    add_link_options($<$<CONFIG:RelWithDebInfo>:/PDBALTPATH:%_PDB%>)
 endif()
+
+# Helper to apply strict warnings to our own targets only.
+function(cheat_strict_warnings target)
+    if (MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+    endif()
+endfunction()
 
 include(FetchContent)
 
@@ -44,10 +58,10 @@ FetchContent_Declare(nlohmann_json
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
-# ---- stb_image (header-only) ----
+# ---- stb_image (header-only) — pin to a reviewed commit, not master.
 FetchContent_Declare(stb
     GIT_REPOSITORY https://github.com/nothings/stb.git
-    GIT_TAG master
+    GIT_TAG         f0569113c93ad095470c54bf34a17b36646bbbb5
 )
 FetchContent_MakeAvailable(stb)
 add_library(stb INTERFACE)

@@ -24,6 +24,7 @@ ID3D11DeviceContext*   GameContext();
 ID3D11RenderTargetView* MainRtv();
 
 bool    IsBound();          // ImGui initialised against game device
-void    OnResize(UINT w, UINT h);
+void    OnResizePre();                 // drop RTV before game's ResizeBuffers
+void    OnResizePost(UINT w, UINT h);  // rebuild RTV after it returns
 
 } // namespace cheat::render

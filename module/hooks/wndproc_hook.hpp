@@ -8,6 +8,4 @@ namespace cheat::hooks {
 void EnsureWndProcSubclass();
 void UninstallWndProcSubclass();
 
-bool IsMenuSwallowingInput();   // true while the menu is open and keyboard-captured
-
 } // namespace cheat::hooks

@@ -73,15 +73,35 @@ python scripts/gen_items_db.py --skins skins.json --stickers stickers.json ...
 
 Writes `data/items.json` + a short SHA-256 next to it.
 
+## Status
+
+- **Offsets**: baked from cs2-dumper (`output/offsets.json` +
+  `output/client_dll.json`) anchored on SteamTracking/GameTracking-CS2.
+  CSGO `m_nFallbackPaintKit`-family fields do not exist on CS2 and are
+  kept as 0 by design — CS2 uses attribute injection via
+  `CAttributeList::SetOrAddAttributeValueByName`.
+- **Phase-B walker**: live. Controller → pawn → `CPlayer_WeaponServices`
+  → `m_hMyWeapons` → `m_AttributeManager + m_Item` → `C_EconItemView`.
+  All outbound into `client.dll` routes through the call-gate pool.
+- **Live preview**: live. Off-screen DX11 render target with a textured
+  rotating quad; the panorama draw is a real DX11 pass, not a static icon.
+- **`SK_VAC_RECON`** (`-DSK_VAC_RECON=ON`): hooks the 161/163 payload
+  builders and SuspendAll/ResumeAll around their bodies; passively reads
+  the VacProcessMonitor shared mapping. Off by default.
+- **`SK_MODULE_STOMP`** (`-DSK_MODULE_STOMP=ON`, injector-side): fallback
+  mapper that places the image inside unused RX padding of a signed,
+  loaded, LDR-tracked module (`rendersystemdx11.dll` by default). Off
+  by default.
+
 ## Open items (per spec §9)
 
-- Live panorama (Phase 2): choose between driving the game's own weapon
-  preview class vs. render-list manipulation.
-- Sticker / charm schema field names — verify on the current build before
-  Phase A goes live.
-- `m_iItemIDHigh = -1` client-only convention — confirm during bring-up.
-- `SK_MODULE_STOMP` fallback stays off by default; revisit if the VAS
-  walker ever reappears (Appendix A.6).
+- Attribute-set function (`SetOrAddAttributeValueByName`) is resolved by
+  AOB at runtime; refresh the sig after schema-breaking game updates.
+- `fn_EconItemView_Update` sig refresh — kept in `signatures.hpp`,
+  resolver lives in `backend_phase_a.cpp`.
+- Full `CCSPlayer_InventoryServices::m_vecLoadoutItems` walk — cs2-dumper
+  doesn't expose the field; Phase-B uses `m_hMyWeapons` which covers
+  held/dropped weapons only.
 
 ## VAC posture summary (ground rules — do not break)
 

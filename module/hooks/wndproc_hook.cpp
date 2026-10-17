@@ -52,8 +52,4 @@ void UninstallWndProcSubclass() {
     g_hwnd = nullptr;
 }
 
-bool IsMenuSwallowingInput() {
-    return cheat::render::IsBound() && cheat::menu::IsOpen();
-}
-
 } // namespace cheat::hooks

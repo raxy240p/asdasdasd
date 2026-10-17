@@ -78,7 +78,7 @@ void CleanupDevice() {
     g_dx = {};
 }
 
-extern "C" LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+// Decl lives in imgui_impl_win32.h.
 LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (ImGui_ImplWin32_WndProcHandler(h, m, w, l)) return 1;
     if (m == WM_SIZE && g_dx.dev && w != SIZE_MINIMIZED) {

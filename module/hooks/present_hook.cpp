@@ -32,10 +32,43 @@ ResizeBuffersFn g_origResize   = nullptr;
 
 std::atomic<bool> g_inPresent{ false };
 
-// Minimal LDE for a 14-byte absolute JMP overwrite. We copy that many bytes
-// into the trampoline, append the far jump back. For a single build target
-// this is enough; a per-build sig audit catches instruction overlap.
+// 14-byte absolute JMP overwrite. We copy that many bytes into the
+// trampoline, append the far jump back. Before patching we scan the stolen
+// window with a conservative "prologue-safe" check (see IsStolenSafe) — any
+// RIP-relative addressing or short/near relative jump bails the install.
+// DXGI's Present / ResizeBuffers prologues are pure save-regs + stack
+// adjust, so this is almost always a clean copy — but we refuse to patch
+// an unsafe prologue rather than relocate it with a full LDE.
 constexpr std::size_t kPatchLen = 14;
+
+bool IsStolenSafe(const std::uint8_t* p) {
+    // Opcode byte → unsafe set we refuse to relocate.
+    for (std::size_t i = 0; i < kPatchLen; ) {
+        const std::uint8_t b = p[i];
+
+        // Short/near relative jumps and calls.
+        if (b == 0xE8 || b == 0xE9 || b == 0xEB) return false;
+        if (b >= 0x70 && b <= 0x7F)              return false; // short jcc
+        if (b == 0x0F && (i + 1) < kPatchLen) {
+            const std::uint8_t b2 = p[i + 1];
+            if (b2 >= 0x80 && b2 <= 0x8F)        return false; // near jcc rel32
+        }
+
+        // RIP-relative addressing: a ModR/M with (mod=00, rm=101) uses [RIP+disp32].
+        // Scanning for 0x05 ModR/M byte after a REX prefix is a quick heuristic:
+        // detect any mov/lea with mod=00 rm=101 (byte & 0xC7 == 0x05).
+        // Conservative: if the byte looks like a ModR/M with mod=00 rm=101
+        // and the preceding byte is in the common prefix set, bail.
+        if (i >= 1 && (b & 0xC7) == 0x05 &&
+            (p[i-1] == 0x8B || p[i-1] == 0x8D || p[i-1] == 0x89 ||
+             p[i-1] == 0xFF)) {
+            return false;
+        }
+
+        ++i;
+    }
+    return true;
+}
 
 // 14-byte absolute JMP [RIP+0]; dq target
 void MakeFarJmp(std::uint8_t out[kPatchLen], std::uint64_t target) {
@@ -97,8 +130,12 @@ HRESULT WINAPI PresentDetour(IDXGISwapChain* sc, UINT sync, UINT flags) {
 HRESULT WINAPI ResizeDetour(IDXGISwapChain* sc, UINT bufCount, UINT w, UINT h,
                             DXGI_FORMAT fmt, UINT flags)
 {
-    cheat::render::OnResize(w, h);
-    return g_origResize(sc, bufCount, w, h, fmt, flags);
+    // Must release the RTV before calling the original; ResizeBuffers refuses
+    // if any back-buffer reference is outstanding. Rebuild after resize.
+    cheat::render::OnResizePre();
+    HRESULT hr = g_origResize(sc, bufCount, w, h, fmt, flags);
+    cheat::render::OnResizePost(w, h);
+    return hr;
 }
 
 } // namespace
@@ -107,17 +144,26 @@ bool InstallPresent() {
     cheat::render::VTable vt;
     if (!cheat::render::ResolveSwapChainVTable(vt)) return false;
 
+    // Refuse to install on an unsafe prologue — see IsStolenSafe above.
+    if (!IsStolenSafe(reinterpret_cast<const std::uint8_t*>(vt.Present)) ||
+        !IsStolenSafe(reinterpret_cast<const std::uint8_t*>(vt.ResizeBuffers)))
+        return false;
+
     std::uint8_t presentPatch[kPatchLen];
     MakeFarJmp(presentPatch, reinterpret_cast<std::uint64_t>(&PresentDetour));
     void* presentTramp = BuildTrampoline(vt.Present);
     if (!presentTramp) return false;
-    g_origPresent = reinterpret_cast<PresentFn>(presentTramp);
 
     std::uint8_t resizePatch[kPatchLen];
     MakeFarJmp(resizePatch, reinterpret_cast<std::uint64_t>(&ResizeDetour));
     void* resizeTramp = BuildTrampoline(vt.ResizeBuffers);
-    if (!resizeTramp) return false;
-    g_origResize = reinterpret_cast<ResizeBuffersFn>(resizeTramp);
+    if (!resizeTramp) {
+        VirtualFree(presentTramp, 0, MEM_RELEASE);
+        return false;
+    }
+
+    g_origPresent = reinterpret_cast<PresentFn>(presentTramp);
+    g_origResize  = reinterpret_cast<ResizeBuffersFn>(resizeTramp);
 
     Install("Present", vt.Present,
             std::vector<std::uint8_t>(presentPatch, presentPatch + kPatchLen),
@@ -129,5 +175,7 @@ bool InstallPresent() {
 }
 
 void UninstallPresent() { UninstallAll(); }
+
+bool PresentInFlight() { return g_inPresent.load(); }
 
 } // namespace cheat::hooks

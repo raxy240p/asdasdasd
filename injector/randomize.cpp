@@ -7,6 +7,7 @@
 #include <cwctype>
 #include <random>
 #include <string>
+#include <string_view>
 
 #pragma comment(lib, "shell32.lib")
 
@@ -91,8 +92,12 @@ std::filesystem::path MakeStagingPath() {
 }
 
 bool SelfRelaunchAndMelt() {
-    // If we're already the staged copy, don't recurse.
-    if (GetEnvironmentVariableW(kSessionTagEnv, nullptr, 0) != 0) return true;
+    // If we're already the staged copy, don't recurse. Clear the breadcrumb
+    // so any CS2 child process we touch later doesn't inherit it.
+    if (GetEnvironmentVariableW(kSessionTagEnv, nullptr, 0) != 0) {
+        SetEnvironmentVariableW(kSessionTagEnv, nullptr);
+        return true;
+    }
 
     wchar_t self[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return false;
@@ -108,10 +113,13 @@ bool SelfRelaunchAndMelt() {
 
     SetEnvironmentVariableW(kSessionTagEnv, L"1");
 
-    // Launch staged copy, inheriting env (including the tag).
+    // Launch staged copy with the original path on its command line. The
+    // staged process does the delete directly on first run — avoids the
+    // cmd.exe-ping-del dance that lights up Sysmon/EDR rules.
     STARTUPINFOW si{ sizeof(si) };
     PROCESS_INFORMATION pi{};
-    std::wstring cmd = L"\"" + staged.wstring() + L"\"";
+    std::wstring cmd =
+        L"\"" + staged.wstring() + L"\" --melt \"" + std::wstring(self) + L"\"";
     BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
                              CREATE_UNICODE_ENVIRONMENT, nullptr, nullptr,
                              &si, &pi);
@@ -119,20 +127,27 @@ bool SelfRelaunchAndMelt() {
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
-    // Melt: cmd.exe deletes our file after a short delay, then exits.
-    // Chosen over MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT) — immediate, no admin.
-    std::wstring del =
-        L"/c ping 127.0.0.1 -n 2 >nul & del /q /f \"" + std::wstring(self) + L"\"";
-    SHELLEXECUTEINFOW se{ sizeof(se) };
-    se.lpFile  = L"cmd.exe";
-    se.lpParameters = del.c_str();
-    se.nShow   = SW_HIDE;
-    se.fMask   = SEE_MASK_NOCLOSEPROCESS;
-    ShellExecuteExW(&se);
-    if (se.hProcess) CloseHandle(se.hProcess);
-
     ExitProcess(0);
     return true;
+}
+
+bool DeleteSelfOrigFromCmdLine() {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return false;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::wstring_view(argv[i]) == L"--melt") {
+            // Retry a few times: the parent may still hold the file briefly.
+            for (int tries = 0; tries < 20; ++tries) {
+                if (DeleteFileW(argv[i + 1])) break;
+                Sleep(50);
+            }
+            LocalFree(argv);
+            return true;
+        }
+    }
+    LocalFree(argv);
+    return false;
 }
 
 const wchar_t* RandomWindowTitle() {

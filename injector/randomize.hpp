@@ -11,11 +11,14 @@ std::wstring MakeRandomName();
 // Fresh %TEMP%\<rand>\<rand>.exe path, directories not yet created.
 std::filesystem::path MakeStagingPath();
 
-// On first run (own path NOT under %TEMP%\<SessionTag>\), relaunch from a
-// random staging path and schedule melt of the current binary. The current
-// process exits cleanly on success. Returns false only on first-run attempt
-// failures (second run is the fresh exe and returns true immediately).
+// On first run (SessionTag env var missing), relaunch from a random staging
+// path and pass the original path as `--melt <path>`. The current process
+// exits cleanly on success. Returns true when we're already the staged copy.
 bool SelfRelaunchAndMelt();
+
+// Call once from WinMain on the staged copy. If the cmdline contains
+// `--melt <path>`, delete <path> (with brief retries while the parent closes).
+bool DeleteSelfOrigFromCmdLine();
 
 // Window identity: title/class randomized per launch. Both strings persist
 // for the lifetime of the process so SetWindowText / RegisterClassW agree.

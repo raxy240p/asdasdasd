@@ -20,11 +20,14 @@ namespace {
 
 struct CavePool {
     std::vector<std::uint8_t*> free;
+    std::vector<std::uint8_t*> used;      // stubs that need restore on unload
     std::size_t                capacity = 0;
 };
 CavePool  g_pool;
 std::mutex g_mx;
 bool       g_scanned = false;
+
+constexpr std::size_t kStubSize = 12;
 
 void ScanOnce() {
     if (g_scanned) return;
@@ -44,7 +47,7 @@ void ScanOnce() {
         if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
         auto* p = h + sec[i].VirtualAddress;
         auto  n = sec[i].Misc.VirtualSize;
-        for (std::size_t off = 0; off + kStub < n; ++off) {
+        for (std::size_t off = 0; off + kStub <= n; ++off) {
             if ((reinterpret_cast<std::uintptr_t>(p + off) & (kAlign - 1)) != 0) continue;
             bool ok = true;
             for (std::size_t k = 0; k < kStub; ++k) {
@@ -69,18 +72,19 @@ void* MakeGateToClient(void* realFn) {
 
     std::uint8_t* dst = g_pool.free.back();
     g_pool.free.pop_back();
+    g_pool.used.push_back(dst);
 
-    std::uint8_t stub[12] = {
+    std::uint8_t stub[kStubSize] = {
         0x48, 0xB8, 0,0,0,0,0,0,0,0,
         0xFF, 0xE0,
     };
     std::memcpy(stub + 2, &realFn, 8);
 
     DWORD old;
-    VirtualProtect(dst, 12, PAGE_EXECUTE_READWRITE, &old);
-    std::memcpy(dst, stub, 12);
-    VirtualProtect(dst, 12, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), dst, 12);
+    VirtualProtect(dst, kStubSize, PAGE_EXECUTE_READWRITE, &old);
+    std::memcpy(dst, stub, kStubSize);
+    VirtualProtect(dst, kStubSize, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), dst, kStubSize);
     return dst;
 }
 
@@ -90,9 +94,19 @@ CaveStats PoolStats() {
 }
 
 void UnloadAllGates() {
-    // Stubs sit in RX padding of client.dll — leaving them is fine (0xCC/0x90
-    // never executes in the game's own flow). We just drop the pool bookkeeping.
     std::lock_guard<std::mutex> _(g_mx);
+    // Restore each used stub back to int3 padding, so client.dll's .text
+    // tail has no "mov rax, imm64; jmp rax" literals left for a scanner.
+    std::uint8_t cc[kStubSize];
+    std::memset(cc, 0xCC, kStubSize);
+    for (auto* dst : g_pool.used) {
+        DWORD old;
+        VirtualProtect(dst, kStubSize, PAGE_EXECUTE_READWRITE, &old);
+        std::memcpy(dst, cc, kStubSize);
+        VirtualProtect(dst, kStubSize, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), dst, kStubSize);
+    }
+    g_pool.used.clear();
     g_pool.free.clear();
     g_pool.capacity = 0;
     g_scanned = false;

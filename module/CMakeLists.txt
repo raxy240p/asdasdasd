@@ -1,4 +1,6 @@
-add_library(cheat SHARED
+option(SK_VAC_RECON "Compile the §6.4 recon utilities" OFF)
+
+set(CHEAT_SOURCES
     dllmain.cpp
     hooks/hook_registry.cpp
     hooks/present_hook.cpp
@@ -15,6 +17,11 @@ add_library(cheat SHARED
     opsec/call_gate.cpp
     opsec/mem_hygiene.cpp
 )
+if (SK_VAC_RECON)
+    list(APPEND CHEAT_SOURCES opsec/vac_recon.cpp)
+endif()
+
+add_library(cheat SHARED ${CHEAT_SOURCES})
 target_link_libraries(cheat PRIVATE imgui nlohmann_json::nlohmann_json stb)
 target_include_directories(cheat PRIVATE ${CMAKE_SOURCE_DIR})
 
@@ -22,13 +29,7 @@ set_target_properties(cheat PROPERTIES
     PREFIX ""           # cheat.dll, not libcheat.dll
     OUTPUT_NAME "cheat"
 )
-
-# Optional recon build (§6.4). Off by default.
-option(SK_VAC_RECON    "Compile the §6.4 recon utilities" OFF)
-option(SK_MODULE_STOMP "Enable module-stomping mapper fallback (§6.7)" OFF)
+cheat_strict_warnings(cheat)
 if (SK_VAC_RECON)
     target_compile_definitions(cheat PRIVATE SK_VAC_RECON=1)
-endif()
-if (SK_MODULE_STOMP)
-    target_compile_definitions(cheat PRIVATE SK_MODULE_STOMP=1)
 endif()

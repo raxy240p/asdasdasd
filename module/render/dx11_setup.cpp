@@ -62,9 +62,11 @@ bool ResolveSwapChainVTable(VTable& out) {
 
 void OnPresent_AdoptDevice(IDXGISwapChain* sc) {
     if (g_bound) return;
-    g_sc = sc;
-    if (FAILED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&g_dev))))
+    if (FAILED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&g_dev)))) {
+        g_dev = nullptr;
         return;
+    }
+    g_sc = sc;
     g_dev->GetImmediateContext(&g_ctx);
     MakeRTV();
 
@@ -79,10 +81,12 @@ void OnPresent_AdoptDevice(IDXGISwapChain* sc) {
     g_bound = true;
 }
 
-void OnResize(UINT /*w*/, UINT /*h*/) {
+void OnResizePre() {
     if (!g_bound) return;
     if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
-    // Caller runs ResizeBuffers via trampoline; we just re-make the RTV.
+}
+void OnResizePost(UINT /*w*/, UINT /*h*/) {
+    if (!g_bound) return;
     MakeRTV();
 }
 

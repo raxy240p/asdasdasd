@@ -6,9 +6,11 @@
 // calls sk_init directly (§3.4 step 8).
 #include "../common/ipc.hpp"
 #include "hooks/present_hook.hpp"
+#include "hooks/wndproc_hook.hpp"
 #include "menu/menu.hpp"
 #include "render/dx11_setup.hpp"
 #include "opsec/mem_hygiene.hpp"
+#include "opsec/call_gate.hpp"
 
 #include <windows.h>
 #include <filesystem>
@@ -47,9 +49,16 @@ void Boot() {
 }
 
 void Teardown() {
+    // Pull the WndProc subclass first — any in-flight message landing on a
+    // detached subclass would call unloaded code.
+    cheat::hooks::UninstallWndProcSubclass();
     cheat::hooks::UninstallPresent();
+    // Give any in-flight Present detour a chance to finish before DX11
+    // shutdown tears down the context ImGui is still using.
+    for (int i = 0; i < 50 && cheat::hooks::PresentInFlight(); ++i) Sleep(2);
     cheat::menu::Shutdown();
     cheat::render::Shutdown();
+    cheat::opsec::UnloadAllGates();
 }
 
 } // namespace

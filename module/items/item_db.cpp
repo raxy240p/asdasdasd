@@ -30,7 +30,7 @@ LoadResult Load(const std::filesystem::path& path) {
                         paint.kit       = p.value("kit", 0);
                         paint.rarity    = p.value("rarity", "common");
                         paint.finishMin = p.value("finish_quality_min", 0.f);
-                        paint.finishMax = p.value("max", 1.f);
+                        paint.finishMax = p.value("finish_quality_max", p.value("max", 1.f));
                         weap.paints.push_back(std::move(paint));
                     }
                 }

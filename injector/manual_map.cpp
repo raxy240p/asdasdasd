@@ -4,16 +4,23 @@
 #include "../common/ipc.hpp"
 
 #include <winternl.h>
+#include <psapi.h>
 #include <algorithm>
 #include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "psapi.lib")
 
-extern "C" NTSTATUS NTAPI NtQueryInformationProcess(
-    HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+// NtQueryInformationProcess is pulled by name from ntdll to dodge the
+// winternl.h-vs-SDK duplicate-decl trap on recent toolchains.
+using NtQIP_t = NTSTATUS (NTAPI*)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+static NtQIP_t NtQIP() {
+    static NtQIP_t fn = reinterpret_cast<NtQIP_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    return fn;
+}
 
 namespace injector::mapper {
 
@@ -71,8 +78,9 @@ BuildRemoteModuleMap(HANDLE proc) {
 
     PROCESS_BASIC_INFORMATION pbi{};
     ULONG ret = 0;
-    if (NtQueryInformationProcess(proc, ProcessBasicInformation,
-                                  &pbi, sizeof(pbi), &ret) != 0) return out;
+    auto fn = NtQIP();
+    if (!fn || fn(proc, ProcessBasicInformation, &pbi, sizeof(pbi), &ret) != 0)
+        return out;
     if (!pbi.PebBaseAddress) return out;
 
     PEB peb{};
@@ -136,11 +144,55 @@ void ApplyRelocs(std::uint8_t* buf, const IMAGE_NT_HEADERS64* nt, std::intptr_t 
     }
 }
 
-// Resolve IAT thunks against local DLL copies.
-// ponytail: system DLLs share bases cross-process on current Windows (boot ASLR);
-// so GetProcAddress(local) == remote fn addr for them. For modules that may not
-// share bases, we rebase: localExportAddr - localBase + remoteBase.
+// Walk the remote module's export directory via RPM — used when the import
+// target is a game DLL we can't LoadLibrary into the injector (circular dep
+// chain). Returns the absolute remote address of the named export.
+std::uintptr_t RemoteExport(HANDLE proc, std::uintptr_t remoteBase, const char* name) {
+    IMAGE_DOS_HEADER dos{};
+    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase),
+                           &dos, sizeof(dos), nullptr)) return 0;
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    IMAGE_NT_HEADERS64 nt{};
+    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + dos.e_lfanew),
+                           &nt, sizeof(nt), nullptr)) return 0;
+    auto& dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress || !dir.Size) return 0;
+
+    std::vector<std::uint8_t> buf(dir.Size);
+    if (!ReadProcessMemory(proc,
+            reinterpret_cast<LPCVOID>(remoteBase + dir.VirtualAddress),
+            buf.data(), dir.Size, nullptr)) return 0;
+
+    auto* ex = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(buf.data());
+    // AddressOfNames/Ordinals/Functions are RVAs on the remote image; we need
+    // their contents, which may lie OUTSIDE the export directory we just read.
+    // Pull the three arrays via additional RPMs.
+    std::vector<DWORD> names(ex->NumberOfNames);
+    std::vector<WORD>  ords (ex->NumberOfNames);
+    std::vector<DWORD> funcs(ex->NumberOfFunctions);
+    ReadProcessMemory(proc,
+        reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfNames),
+        names.data(), names.size() * sizeof(DWORD), nullptr);
+    ReadProcessMemory(proc,
+        reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfNameOrdinals),
+        ords.data(), ords.size() * sizeof(WORD), nullptr);
+    ReadProcessMemory(proc,
+        reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfFunctions),
+        funcs.data(), funcs.size() * sizeof(DWORD), nullptr);
+
+    for (DWORD i = 0; i < ex->NumberOfNames; ++i) {
+        char n[256]{};
+        if (!ReadProcessMemory(proc,
+                reinterpret_cast<LPCVOID>(remoteBase + names[i]),
+                n, sizeof(n) - 1, nullptr)) continue;
+        if (std::strcmp(n, name) == 0)
+            return remoteBase + funcs[ords[i]];
+    }
+    return 0;
+}
+
 bool ResolveImports(std::uint8_t* localImage, const IMAGE_NT_HEADERS64* nt,
+                    HANDLE proc,
                     const std::unordered_map<std::string, std::uintptr_t>& remoteMap)
 {
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -149,15 +201,20 @@ bool ResolveImports(std::uint8_t* localImage, const IMAGE_NT_HEADERS64* nt,
     auto* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(localImage + dir.VirtualAddress);
     for (; imp->Name; ++imp) {
         const char* dllName = reinterpret_cast<const char*>(localImage + imp->Name);
-        HMODULE local = LocalDll(dllName);
-        if (!local) return false;
 
         std::string lower = dllName;
         std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
         auto it = remoteMap.find(lower);
+        const std::uintptr_t remoteBase = (it != remoteMap.end()) ? it->second : 0;
+
+        // Prefer loading locally so we can use GetProcAddress; fall back to
+        // walking the REMOTE export table when it's a game DLL we can't load
+        // (client.dll, engine2.dll, server.dll — these need the full game
+        // dependency chain to initialise and will fail LoadLibraryW).
+        HMODULE local = LocalDll(dllName);
         std::intptr_t rebase = 0;
-        if (it != remoteMap.end())
-            rebase = static_cast<std::intptr_t>(it->second) -
+        if (local && remoteBase)
+            rebase = static_cast<std::intptr_t>(remoteBase) -
                      reinterpret_cast<std::intptr_t>(local);
 
         auto* oft = reinterpret_cast<ULONGLONG*>(
@@ -165,94 +222,157 @@ bool ResolveImports(std::uint8_t* localImage, const IMAGE_NT_HEADERS64* nt,
                                                   : imp->FirstThunk));
         auto* ft  = reinterpret_cast<ULONGLONG*>(localImage + imp->FirstThunk);
         for (; *oft; ++oft, ++ft) {
-            FARPROC addr = nullptr;
+            ULONGLONG remoteAddr = 0;
+
             if (*oft & IMAGE_ORDINAL_FLAG64) {
-                addr = GetProcAddress(local,
-                        reinterpret_cast<LPCSTR>(*oft & 0xFFFF));
+                if (!local) return false;      // ordinal imports always need local
+                FARPROC a = GetProcAddress(local, reinterpret_cast<LPCSTR>(*oft & 0xFFFF));
+                if (!a) return false;
+                remoteAddr = reinterpret_cast<ULONGLONG>(a) + rebase;
             } else {
                 auto* ib = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
                                localImage + (*oft & 0x7FFFFFFF));
-                addr = GetProcAddress(local, ib->Name);
+                if (local) {
+                    FARPROC a = GetProcAddress(local, ib->Name);
+                    if (a) remoteAddr = reinterpret_cast<ULONGLONG>(a) + rebase;
+                }
+                if (!remoteAddr && remoteBase) {
+                    remoteAddr = RemoteExport(proc, remoteBase, ib->Name);
+                }
+                if (!remoteAddr) return false;
             }
-            if (!addr) return false;
-            *ft = reinterpret_cast<ULONGLONG>(addr) + rebase;
+
+            *ft = remoteAddr;
         }
     }
     return true;
 }
 
-// A thread-hijack trampoline. See HijackEnter() for the layout we assemble.
-// It calls module entry (sk_init / DllMain) then returns to the saved RIP.
+// Thread-hijack trampoline — fully reg-save, aligned, volatiles+XMM preserved.
+// The hijacked thread may have been suspended at any RIP mod 16 and with any
+// volatile reg state live; we must restore everything bit-exact before the
+// jmp back to savedRip or cs2 crashes on resume.
 struct ShimLayout {
-    std::uint8_t  bytes[0x80]; // more than enough for the stub below
+    std::uint8_t  bytes[0x100];
     std::size_t   size;
 };
 
-// Build:
-//   push rax ... (save volatile regs we'll touch via return-to-saved-rip)
-//   mov rcx, <base>
-//   mov rdx, 1          ; DLL_PROCESS_ATTACH
-//   xor r8, r8
-//   mov rax, <entry>
-//   call rax
-//   mov rax, <savedRip>
-//   jmp rax
 ShimLayout BuildShim(std::uintptr_t base, std::uintptr_t entry, std::uintptr_t savedRip) {
     ShimLayout sl{};
     std::uint8_t* p = sl.bytes;
-    auto emit8  = [&](std::uint8_t  v) { *p++ = v; };
+    auto emit  = [&](std::initializer_list<std::uint8_t> xs) {
+        for (auto b : xs) *p++ = b;
+    };
     auto emit64 = [&](std::uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
 
-    // sub rsp, 0x28  (shadow space + align)
-    emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
-    // mov rcx, base
-    emit8(0x48); emit8(0xB9); emit64(static_cast<std::uint64_t>(base));
-    // mov rdx, 1 (DLL_PROCESS_ATTACH)
-    emit8(0x48); emit8(0xC7); emit8(0xC2); emit8(0x01); emit8(0x00); emit8(0x00); emit8(0x00);
-    // xor r8, r8
-    emit8(0x4D); emit8(0x31); emit8(0xC0);
-    // mov rax, entry
-    emit8(0x48); emit8(0xB8); emit64(static_cast<std::uint64_t>(entry));
-    // call rax
-    emit8(0xFF); emit8(0xD0);
-    // add rsp, 0x28
-    emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
-    // mov rax, savedRip
-    emit8(0x48); emit8(0xB8); emit64(static_cast<std::uint64_t>(savedRip));
-    // jmp rax
-    emit8(0xFF); emit8(0xE0);
+    // --- save state (RBP is nonvolatile — we clobber it to anchor rsp) ---
+    emit({0x55});                                // push rbp
+    emit({0x9C});                                // pushfq
+    emit({0x50});                                // push rax
+    emit({0x51});                                // push rcx
+    emit({0x52});                                // push rdx
+    emit({0x41, 0x50});                          // push r8
+    emit({0x41, 0x51});                          // push r9
+    emit({0x41, 0x52});                          // push r10
+    emit({0x41, 0x53});                          // push r11
+    emit({0x48, 0x83, 0xEC, 0x60});              // sub rsp, 0x60
+    emit({0xF3, 0x0F, 0x7F, 0x04, 0x24});                 // movdqu [rsp], xmm0
+    emit({0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x10});           // movdqu [rsp+0x10], xmm1
+    emit({0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x20});           // movdqu [rsp+0x20], xmm2
+    emit({0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x30});           // movdqu [rsp+0x30], xmm3
+    emit({0xF3, 0x0F, 0x7F, 0x64, 0x24, 0x40});           // movdqu [rsp+0x40], xmm4
+    emit({0xF3, 0x0F, 0x7F, 0x6C, 0x24, 0x50});           // movdqu [rsp+0x50], xmm5
+
+    // --- anchor rsp, align, shadow space ---
+    emit({0x48, 0x89, 0xE5});                    // mov rbp, rsp
+    emit({0x48, 0x83, 0xE4, 0xF0});              // and rsp, -16
+    emit({0x48, 0x83, 0xEC, 0x20});              // sub rsp, 0x20
+
+    // --- call entry(base, DLL_PROCESS_ATTACH, 0) ---
+    emit({0x48, 0xB9}); emit64(static_cast<std::uint64_t>(base));           // mov rcx, imm64
+    emit({0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00});                       // mov rdx, 1
+    emit({0x4D, 0x31, 0xC0});                                               // xor r8, r8
+    emit({0x48, 0xB8}); emit64(static_cast<std::uint64_t>(entry));          // mov rax, imm64
+    emit({0xFF, 0xD0});                                                     // call rax
+
+    // --- restore rsp, volatiles, flags ---
+    emit({0x48, 0x89, 0xEC});                    // mov rsp, rbp
+    emit({0xF3, 0x0F, 0x6F, 0x04, 0x24});                 // movdqu xmm0, [rsp]
+    emit({0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x10});           // movdqu xmm1, [rsp+0x10]
+    emit({0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x20});           // movdqu xmm2, [rsp+0x20]
+    emit({0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x30});           // movdqu xmm3, [rsp+0x30]
+    emit({0xF3, 0x0F, 0x6F, 0x64, 0x24, 0x40});           // movdqu xmm4, [rsp+0x40]
+    emit({0xF3, 0x0F, 0x6F, 0x6C, 0x24, 0x50});           // movdqu xmm5, [rsp+0x50]
+    emit({0x48, 0x83, 0xC4, 0x60});              // add rsp, 0x60
+    emit({0x41, 0x5B});                          // pop r11
+    emit({0x41, 0x5A});                          // pop r10
+    emit({0x41, 0x59});                          // pop r9
+    emit({0x41, 0x58});                          // pop r8
+    emit({0x5A});                                // pop rdx
+    emit({0x59});                                // pop rcx
+    emit({0x58});                                // pop rax
+    emit({0x9D});                                // popfq
+    emit({0x5D});                                // pop rbp
+
+    // --- jmp back to the exact saved RIP ---
+    emit({0x48, 0xB8}); emit64(static_cast<std::uint64_t>(savedRip));       // mov rax, imm64
+    emit({0xFF, 0xE0});                                                     // jmp rax
 
     sl.size = static_cast<std::size_t>(p - sl.bytes);
     return sl;
 }
 
-// Pick a reasonable thread to hijack. Loader thread is the lowest tid of the
-// pid in practice. Open with required rights; skip ones we can't touch.
+// Pick a hijackable thread. For each candidate we suspend, read RIP, and
+// skip anything parked inside ntdll.dll (a wait call that won't return to
+// user code promptly after SetThreadContext). Lowest tid among valid
+// candidates wins — in practice that's the game's main thread.
 HANDLE OpenHijackableThread(DWORD pid, DWORD& outTid) {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    MODULEINFO mi{};
+    GetModuleInformation(GetCurrentProcess(), ntdll, &mi, sizeof(mi));
+    const auto ntBase = reinterpret_cast<std::uintptr_t>(mi.lpBaseOfDll);
+    const auto ntEnd  = ntBase + mi.SizeOfImage;
+
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) return nullptr;
+
+    struct Candidate { DWORD tid; HANDLE handle; };
+    std::vector<Candidate> cands;
     THREADENTRY32 te{ sizeof(te) };
-    HANDLE best = nullptr;
-    DWORD bestTid = 0;
-    if (Thread32First(snap, &te)) {
-        do {
-            if (te.th32OwnerProcessID != pid) continue;
-            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
-                                  THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
-                                  FALSE, te.th32ThreadID);
-            if (!h) continue;
-            if (!best || te.th32ThreadID < bestTid) {
-                if (best) CloseHandle(best);
-                best = h;
-                bestTid = te.th32ThreadID;
-            } else {
-                CloseHandle(h);
-            }
-        } while (Thread32Next(snap, &te));
-    }
+    if (Thread32First(snap, &te)) do {
+        if (te.th32OwnerProcessID != pid) continue;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                              THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
+                              FALSE, te.th32ThreadID);
+        if (h) cands.push_back({ te.th32ThreadID, h });
+    } while (Thread32Next(snap, &te));
     CloseHandle(snap);
-    outTid = bestTid;
-    return best;
+
+    // Sort by tid ascending.
+    std::sort(cands.begin(), cands.end(),
+              [](const Candidate& a, const Candidate& b) { return a.tid < b.tid; });
+
+    for (auto& c : cands) {
+        if (SuspendThread(c.handle) == (DWORD)-1) { CloseHandle(c.handle); continue; }
+        CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_CONTROL;
+        if (!GetThreadContext(c.handle, &ctx)) {
+            ResumeThread(c.handle); CloseHandle(c.handle); continue;
+        }
+        ResumeThread(c.handle);
+        const auto rip = static_cast<std::uintptr_t>(ctx.Rip);
+        if (rip >= ntBase && rip < ntEnd) {
+            // Parked in ntdll (likely NtWaitForSingleObject or similar).
+            CloseHandle(c.handle);
+            continue;
+        }
+        // Winner — close the rest and return.
+        for (auto& r : cands) if (r.handle && r.tid != c.tid) CloseHandle(r.handle);
+        outTid = c.tid;
+        return c.handle;
+    }
+    for (auto& r : cands) if (r.handle) CloseHandle(r.handle);
+    outTid = 0;
+    return nullptr;
 }
 
 std::uintptr_t FindExport(const std::uint8_t* localImage, const IMAGE_NT_HEADERS64* nt,
@@ -284,10 +404,10 @@ Result Inject(DWORD pid,
     if (!ParsePE(dllBytes, img))
         return { false, "parse", "PE invalid", 0 };
 
+    // Minimum rights per §6.6; thread hijack rights are requested per-thread.
     HANDLE proc = OpenProcess(
         PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
-        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_DUP_HANDLE |
-        PROCESS_SUSPEND_RESUME,
+        PROCESS_QUERY_LIMITED_INFORMATION,
         FALSE, pid);
     if (!proc) return { false, "open", "OpenProcess failed", 0 };
 
@@ -330,7 +450,7 @@ Result Inject(DWORD pid,
     if (!ResolveImports(local.data(),
                         reinterpret_cast<const IMAGE_NT_HEADERS64*>(
                             local.data() + img.dos->e_lfanew),
-                        remoteMap)) {
+                        proc, remoteMap)) {
         VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
         CloseHandle(proc);
         return { false, "imports", "IAT resolution failed", 0 };
@@ -435,13 +555,29 @@ Result Inject(DWORD pid,
     }
 
     if (opts.eraseHeaders) {
-        // Zero MZ and e_lfanew — P1 header erase.
-        std::uint8_t z[0x40] = {};
-        WriteProcessMemory(proc, remote, z, sizeof(z), nullptr);
+        // Wipe the full headers region (DOS + NT + section table). Nothing
+        // in the mapped image references them at runtime; relocs are done,
+        // imports resolved, TLS already fired. A naive MZ-scanner and a
+        // section-table walker both find nothing.
+        const DWORD hdrSz = img.nt->OptionalHeader.SizeOfHeaders;
+        std::vector<std::uint8_t> zeros(hdrSz, 0);
+        DWORD oldH = 0;
+        VirtualProtectEx(proc, remote, hdrSz, PAGE_READWRITE, &oldH);
+        WriteProcessMemory(proc, remote, zeros.data(), hdrSz, nullptr);
+        VirtualProtectEx(proc, remote, hdrSz, PAGE_READONLY, &oldH);
         say("headers erased");
     }
 
-    VirtualFreeEx(proc, shimRemote, 0, MEM_RELEASE);
+    // Scrub the local copy of the DLL (fully-prepared image, resolved IAT)
+    // before the vector frees its heap pages. The plaintext never lives in
+    // free'd heap. SecureZeroMemory isn't optimised away.
+    SecureZeroMemory(local.data(), local.size());
+
+    // Deliberately do NOT free shimRemote here. The hijacked thread may still
+    // be in flight (sk_init -> game-thread work) and the shim's trailing jmp
+    // back to savedRip only runs after entry returns. A 4KB RX leak inside
+    // cs2 is cheaper than racing a use-after-free. ponytail: leak, don't
+    // race.
     CloseHandle(proc);
 
     if (!ready && opts.readyFlagRva)

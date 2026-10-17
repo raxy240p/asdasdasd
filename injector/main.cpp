@@ -4,8 +4,9 @@
 #include <windows.h>
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
-    // §3.1: copy to %TEMP%\<rand>\<rand>.exe and relaunch; schedule melt of
-    // the original. Returns true immediately when we're already the staged copy.
+    // §3.1: first run → stage to %TEMP%\<rand>\<rand>.exe and relaunch.
+    // Staged run → delete the original named by --melt, then UI.
     injector::randomize::SelfRelaunchAndMelt();
+    injector::randomize::DeleteSelfOrigFromCmdLine();
     return injector::ui::Run(hInst);
 }
