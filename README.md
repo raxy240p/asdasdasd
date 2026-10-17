@@ -27,12 +27,13 @@ repo/
 
 ```powershell
 # x64 only, MSVC. CMake pulls ImGui / nlohmann-json / stb automatically.
-cmake --preset=win64            # or: cmake -S . -B build -A x64
+cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-Artifacts land in `build\Release\loader.exe` and `build\Release\cheat.dll`.
-Put them next to each other and run `loader.exe`.
+Artifacts land in `build\injector\Release\loader.exe` and
+`build\module\Release\cheat.dll`. Put them next to each other and run
+`loader.exe`.
 
 ## Flow
 

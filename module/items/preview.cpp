@@ -53,7 +53,9 @@ Mat4 Perspective(float fovY, float aspect, float znear, float zfar) {
 }
 
 const char* kVS = R"(
-cbuffer CB : register(b0) { float4x4 mvp; }
+// row_major: our C++ Mat4 is laid out row-first; HLSL defaults to column-major
+// so we annotate here instead of transposing on upload.
+cbuffer CB : register(b0) { row_major float4x4 mvp; }
 struct V2P { float4 pos : SV_POSITION; float2 uv : TEXCOORD; };
 V2P main(float3 p : POSITION, float2 uv : TEXCOORD) {
     V2P o;
@@ -99,7 +101,11 @@ public:
         if (dev) cache_.Bind(dev);
         char key[64];
         std::snprintf(key, sizeof(key), "%u_%d", item.definitionIndex, item.paintKit);
-        if (auto* tex = cache_.Get(key)) ImGui::Image(tex, size);
+        // Scope ImGui IDs by instance address so duplicate def/kit pairs
+        // (same skin twice in inventory) don't collide.
+        ImGui::PushID(&item);
+        if (auto* tex = cache_.Get(key))
+            ImGui::Image((ImTextureID)(intptr_t)tex, size);
         else {
             ImGui::PushStyleColor(ImGuiCol_ChildBg, 0xFF333333);
             ImGui::BeginChild(key, size, true, ImGuiWindowFlags_NoScrollbar);
@@ -107,6 +113,7 @@ public:
             ImGui::EndChild();
             ImGui::PopStyleColor();
         }
+        ImGui::PopID();
     }
 
     void DrawPanorama(const ItemConfig& item, ImVec2 size) override {
@@ -125,7 +132,7 @@ public:
         if (!srv) { DrawIcon(item, size); return; }
 
         RenderPass(ctx, srv, size);
-        ImGui::Image(rtSrv_, size);
+        ImGui::Image((ImTextureID)(intptr_t)rtSrv_, size);
     }
 
 private:
@@ -194,7 +201,7 @@ private:
         D3D11_SAMPLER_DESC sd{};
         sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sd.ComparisonFunc = D3D11_COMPARISON_ALWAYS;
+        // ComparisonFunc only applies to comparison filters; omitted here.
         dev->CreateSamplerState(&sd, &smp_);
 
         D3D11_RASTERIZER_DESC rd{};
@@ -244,7 +251,7 @@ private:
                     ImVec2 size)
     {
         const float t = static_cast<float>(GetTickCount64()) * 0.001f;
-        const float angle = std::fmod(t * 0.9f, 6.2831853f);
+        const float angle = std::fmod(t * 0.4f, 6.2831853f);
 
         Mat4 proj  = Perspective(0.8f, size.x / (size.y + 0.0001f), 0.1f, 100.f);
         Mat4 view  = Translate(0, 0, 3.0f);
@@ -257,12 +264,45 @@ private:
             ctx->Unmap(cb_, 0);
         }
 
-        // Capture game render state so we don't poison the next ImGui draw.
-        ID3D11RenderTargetView* oldRtv = nullptr;
-        ID3D11DepthStencilView* oldDsv = nullptr;
-        ctx->OMGetRenderTargets(1, &oldRtv, &oldDsv);
-        D3D11_VIEWPORT oldVp[8]; UINT nVp = 8;
-        ctx->RSGetViewports(&nVp, oldVp);
+        // Capture the full set of pipeline state we touch, so neither the
+        // next ImGui draw nor the game's own rendering sees our overrides.
+        // Each Get* AddRefs — we Release in Restore().
+        struct Saved {
+            ID3D11InputLayout*        il     = nullptr;
+            D3D11_PRIMITIVE_TOPOLOGY  topo   = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+            ID3D11Buffer*             vb     = nullptr;
+            UINT                      stride = 0;
+            UINT                      offset = 0;
+            ID3D11VertexShader*       vs     = nullptr;
+            ID3D11Buffer*             vscb   = nullptr;
+            ID3D11PixelShader*        ps     = nullptr;
+            ID3D11SamplerState*       pssmp  = nullptr;
+            ID3D11ShaderResourceView* pssrv  = nullptr;
+            ID3D11RasterizerState*    rs     = nullptr;
+            ID3D11DepthStencilState*  ds     = nullptr;
+            UINT                      sref   = 0;
+            ID3D11BlendState*         bs     = nullptr;
+            float                     bf[4]  = {0,0,0,0};
+            UINT                      bmask  = 0;
+            ID3D11RenderTargetView*   rtv    = nullptr;
+            ID3D11DepthStencilView*   dsv    = nullptr;
+            D3D11_VIEWPORT            vp[8]  {};
+            UINT                      nVp    = 8;
+        } s;
+
+        ctx->IAGetInputLayout(&s.il);
+        ctx->IAGetPrimitiveTopology(&s.topo);
+        ctx->IAGetVertexBuffers(0, 1, &s.vb, &s.stride, &s.offset);
+        ctx->VSGetShader(&s.vs, nullptr, nullptr);
+        ctx->VSGetConstantBuffers(0, 1, &s.vscb);
+        ctx->PSGetShader(&s.ps, nullptr, nullptr);
+        ctx->PSGetSamplers(0, 1, &s.pssmp);
+        ctx->PSGetShaderResources(0, 1, &s.pssrv);
+        ctx->RSGetState(&s.rs);
+        ctx->OMGetDepthStencilState(&s.ds, &s.sref);
+        ctx->OMGetBlendState(&s.bs, s.bf, &s.bmask);
+        ctx->OMGetRenderTargets(1, &s.rtv, &s.dsv);
+        ctx->RSGetViewports(&s.nVp, s.vp);
 
         const float clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
         ctx->ClearRenderTargetView(rtRtv_, clear);
@@ -288,14 +328,33 @@ private:
 
         ctx->Draw(6, 0);
 
-        // Restore. ImGui will set its own full state next anyway, but leaving
-        // the game thread's state intact is cheap insurance.
-        ID3D11ShaderResourceView* nullSrv = nullptr;
-        ctx->PSSetShaderResources(0, 1, &nullSrv);
-        ctx->OMSetRenderTargets(1, &oldRtv, oldDsv);
-        ctx->RSSetViewports(nVp, oldVp);
-        if (oldRtv) oldRtv->Release();
-        if (oldDsv) oldDsv->Release();
+        // Restore. Put each slot back exactly as captured, then drop refs.
+        ctx->IASetInputLayout(s.il);
+        ctx->IASetPrimitiveTopology(s.topo);
+        ctx->IASetVertexBuffers(0, 1, &s.vb, &s.stride, &s.offset);
+        ctx->VSSetShader(s.vs, nullptr, 0);
+        ctx->VSSetConstantBuffers(0, 1, &s.vscb);
+        ctx->PSSetShader(s.ps, nullptr, 0);
+        ctx->PSSetSamplers(0, 1, &s.pssmp);
+        ctx->PSSetShaderResources(0, 1, &s.pssrv);
+        ctx->RSSetState(s.rs);
+        ctx->OMSetDepthStencilState(s.ds, s.sref);
+        ctx->OMSetBlendState(s.bs, s.bf, s.bmask);
+        ctx->OMSetRenderTargets(1, &s.rtv, s.dsv);
+        ctx->RSSetViewports(s.nVp, s.vp);
+
+        if (s.il)    s.il->Release();
+        if (s.vb)    s.vb->Release();
+        if (s.vs)    s.vs->Release();
+        if (s.vscb)  s.vscb->Release();
+        if (s.ps)    s.ps->Release();
+        if (s.pssmp) s.pssmp->Release();
+        if (s.pssrv) s.pssrv->Release();
+        if (s.rs)    s.rs->Release();
+        if (s.ds)    s.ds->Release();
+        if (s.bs)    s.bs->Release();
+        if (s.rtv)   s.rtv->Release();
+        if (s.dsv)   s.dsv->Release();
     }
 
     void Release() {

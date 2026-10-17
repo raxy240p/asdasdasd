@@ -45,42 +45,88 @@ const char* RarityLabel(const std::string& r) {
 }
 
 void DrawCategoryStrip(State& S) {
-    const float avail = ImGui::GetContentRegionAvail().x;
-    const float minBtn = 90.0f;
-    float x = 0.0f;
+    // Horizontally-scrollable child so 15 categories at 90px each don't
+    // clip or wrap awkwardly on narrow windows.
+    ImGui::BeginChild("##catstrip", ImVec2(0, 36), false,
+                      ImGuiWindowFlags_HorizontalScrollbar);
     for (const char* cat : kCategoryOrder) {
-        const bool have = S.db.categories.count(cat) != 0 ||
-                          std::strcmp(cat, "Pets") == 0;
+        const bool have =
+            S.db.categories.count(cat) != 0 ||
+            (std::strcmp(cat, "Stickers") == 0 && !S.db.stickers.empty()) ||
+            (std::strcmp(cat, "Charms")   == 0 && !S.db.charms.empty())   ||
+            (std::strcmp(cat, "Agents")   == 0 && !S.db.agents.empty())   ||
+            (std::strcmp(cat, "Cases")    == 0 && !S.db.cases.empty())    ||
+            (std::strcmp(cat, "Keys")     == 0 && !S.db.keys.empty());
         const bool sel  = S.selCategory == cat;
 
         if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
         if (!have) ImGui::BeginDisabled();
-        if (ImGui::Button(cat, {minBtn, 24})) {
+        if (ImGui::Button(cat, {90, 24})) {
             S.selCategory = cat;
             S.selWeapon.clear();
             S.selPaintKit = -1;
         }
         if (!have) ImGui::EndDisabled();
         if (sel) ImGui::PopStyleColor();
-
-        x += minBtn + ImGui::GetStyle().ItemSpacing.x;
-        if (x + minBtn < avail) ImGui::SameLine();
-        else                     { ImGui::NewLine(); x = 0.0f; }
+        ImGui::SameLine();
     }
-    if (x > 0.0f) ImGui::NewLine();
+    ImGui::EndChild();
     ImGui::Separator();
 }
 
 void DrawWeaponList(State& S, float width) {
     ImGui::BeginChild("weap", {width, 0}, true);
-    auto cit = S.db.categories.find(S.selCategory);
-    if (cit == S.db.categories.end()) {
-        ImGui::TextDisabled("pick a category above");
+
+    // Non-weapon categories live in their own buckets, not db.categories.
+    // Selecting a row commits an ItemConfig directly (no paint-kit step).
+    auto commit = [&](const std::string& name, cheat::items::Category cat) {
+        S.selWeapon = name;
+        S.editing = {};
+        S.editing.category = cat;
+        for (auto& s : S.editing.stickers) s.scale = 1.f;
+        S.editorOpen = true;
+    };
+
+    if (S.selCategory == "Stickers") {
+        for (const auto& [n, s] : S.db.stickers)
+            if (ImGui::Selectable(n.c_str(), S.selWeapon == n)) {
+                commit(n, cheat::items::Category::Sticker);
+                S.editing.stickers[0].stickerId = s.id;
+            }
+    } else if (S.selCategory == "Charms") {
+        for (const auto& [n, c] : S.db.charms)
+            if (ImGui::Selectable(n.c_str(), S.selWeapon == n)) {
+                commit(n, cheat::items::Category::Charm);
+                S.editing.charm.charmId = c.id;
+            }
+    } else if (S.selCategory == "Agents") {
+        for (const auto& [n, a] : S.db.agents)
+            if (ImGui::Selectable(n.c_str(), S.selWeapon == n)) {
+                commit(n, cheat::items::Category::Agent);
+                S.editing.definitionIndex = a.defIndex;
+            }
+    } else if (S.selCategory == "Cases") {
+        for (const auto& [n, k] : S.db.cases)
+            if (ImGui::Selectable(n.c_str(), S.selWeapon == n)) {
+                commit(n, cheat::items::Category::Case);
+                S.editing.definitionIndex = k.defIndex;
+            }
+    } else if (S.selCategory == "Keys") {
+        for (const auto& [n, k] : S.db.keys)
+            if (ImGui::Selectable(n.c_str(), S.selWeapon == n)) {
+                commit(n, cheat::items::Category::Key);
+                S.editing.definitionIndex = k.defIndex;
+            }
     } else {
-        for (auto& [name, w] : cit->second.weapons) {
-            if (ImGui::Selectable(name.c_str(), S.selWeapon == name)) {
-                S.selWeapon = name;
-                S.selPaintKit = -1;
+        auto cit = S.db.categories.find(S.selCategory);
+        if (cit == S.db.categories.end()) {
+            ImGui::TextDisabled("pick a category above");
+        } else {
+            for (auto& [name, w] : cit->second.weapons) {
+                if (ImGui::Selectable(name.c_str(), S.selWeapon == name)) {
+                    S.selWeapon = name;
+                    S.selPaintKit = -1;
+                }
             }
         }
     }
@@ -133,8 +179,7 @@ void DrawPaintList(State& S, float width) {
             ImGui::TextDisabled("kit %d · %.2f–%.2f", p->kit, p->finishMin, p->finishMax);
             ImGui::EndGroup();
 
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x > 70
-                            ? ImGui::GetWindowWidth() - 70 : 0);
+            ImGui::SameLine(ImGui::GetContentRegionMax().x - 70);
             if (ImGui::Button("Select", {60, 44})) {
                 S.editing = {};
                 S.editing.category        = cheat::items::Category::Custom;
@@ -164,7 +209,7 @@ void DrawPreviewPane(State& S, float width) {
     }
     auto& it = S.editing;
 
-    const float side = std::min(width - 24.0f, 260.0f);
+    const float side = (width > 48.0f) ? std::min(width - 24.0f, 260.0f) : 48.0f;
     if (S.preview) S.preview->DrawPanorama(it, {side, side});
     ImGui::Separator();
 
@@ -186,11 +231,9 @@ void DrawPreviewPane(State& S, float width) {
             ImGui::Text("Slot %d", i);
             ImGui::SetNextItemWidth(80); ImGui::SameLine();
             ImGui::InputInt("id", &s.stickerId, 0, 0);
-            ImGui::SetNextItemWidth(60);
-            ImGui::SliderFloat("wear",  &s.wear, 0.f, 1.f);
-            ImGui::SetNextItemWidth(60); ImGui::SameLine();
-            ImGui::SliderFloat("scl",   &s.scale, 0.1f, 5.f);
-            ImGui::SetNextItemWidth(60); ImGui::SameLine();
+            // One slider per line so a narrow preview pane doesn't overflow.
+            ImGui::SliderFloat("wear",  &s.wear,     0.f,    1.f);
+            ImGui::SliderFloat("scl",   &s.scale,    0.1f,   5.f);
             ImGui::SliderFloat("rot",   &s.rotation, -180.f, 180.f);
             ImGui::PopID();
         }
