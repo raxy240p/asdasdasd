@@ -183,8 +183,21 @@ int Run(HINSTANCE hInst) {
     wc.lpszClassName = wndClass;
     RegisterClassExW(&wc);
 
-    g_hwnd = CreateWindowExW(0, wndClass, wndTitle, WS_OVERLAPPEDWINDOW,
-                             CW_USEDEFAULT, CW_USEDEFAULT, 420, 360,
+    // Small, fixed-size launcher window — no resize, no maximize so the UI
+    // can't be stretched to full-screen. The cheat menu NEVER lives here;
+    // it lives in-game via INSERT.
+    const DWORD style =
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    const int   wndW = 460;
+    const int   wndH = 420;
+    // Center on the primary monitor's work area so it never spawns under
+    // the taskbar on 1440x1080 setups.
+    RECT work{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    const int cx = work.left + ((work.right  - work.left) - wndW) / 2;
+    const int cy = work.top  + ((work.bottom - work.top ) - wndH) / 2;
+    g_hwnd = CreateWindowExW(0, wndClass, wndTitle, style,
+                             cx, cy, wndW, wndH,
                              nullptr, nullptr, hInst, nullptr);
     if (!CreateDevice(g_hwnd)) { UnregisterClassW(wndClass, hInst); return 1; }
 

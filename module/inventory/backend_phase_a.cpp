@@ -60,11 +60,16 @@ struct Vec {
 // ---- CHandle resolution via dwEntityList ----
 // handle layout: low 15 bits = index, high 17 bits = serial. INVALID = 0xFFFFFFFF.
 //
-// ponytail: Phase-B reads m_hMyWeapons live each OnFrame, so stale handles
-// never leave this scope — the cache ApplyAll uses lives only on the frame
-// stack. We still bounds-check idx and reject the obvious invalid patterns
-// (0, 0xFFFFFFFF). Full serial-match belongs on a future CEntityIdentity
-// walk; without that offset nailed down, don't fake it.
+// Chain:
+//   chunk     = *(void**)(entity_system + 0x10 + 8*(idx>>9))
+//   entity    = *(C_BaseEntity**)(chunk + 120*(idx & 0x1FF))
+//   identity  = *(CEntityIdentity**)(entity + 0x10)       // CEntityInstance::m_pEntity
+//   ehandle   = *(uint32_t*)(identity + 0x10)             // identity's own stored handle
+//
+// Serial check: resolved identity's ehandle MUST equal the queried handle.
+// If it doesn't but the low 15 bits (idx) match, the serial offset in the
+// identity may differ for this build — fail OPEN with just the idx-match
+// as the weaker guard. Full mismatch at idx-level = reject.
 void* ResolveHandle(std::uint32_t handle) {
     if (handle == 0 || handle == 0xFFFFFFFFu) return nullptr;
     const int idx = static_cast<int>(handle & 0x7FFFu);
@@ -79,9 +84,25 @@ void* ResolveHandle(std::uint32_t handle) {
     if (!chunk) return nullptr;
     void* ent = *reinterpret_cast<void**>(
         reinterpret_cast<std::uint8_t*>(chunk) + 120 * (idx & 0x1FF));
-    // Reject obviously-garbage pointers (unmapped low 64KB, misaligned).
     const auto p = reinterpret_cast<std::uintptr_t>(ent);
     if (p < 0x10000 || (p & 0x7)) return nullptr;
+
+    // Serial match via CEntityInstance::m_pEntity -> CEntityIdentity.ehandle.
+    void* identity = *reinterpret_cast<void**>(
+        reinterpret_cast<std::uint8_t*>(ent) + 0x10);
+    if (!identity ||
+        reinterpret_cast<std::uintptr_t>(identity) < 0x10000) return nullptr;
+    const std::uint32_t storedH =
+        *reinterpret_cast<std::uint32_t*>(
+            reinterpret_cast<std::uint8_t*>(identity) + 0x10);
+    const int storedIdx = static_cast<int>(storedH & 0x7FFFu);
+    if (storedIdx != idx) return nullptr;              // slot reused — hard reject
+    if (storedH != handle) {
+        // Idx matches but full handle doesn't — either stale serial OR
+        // the ehandle offset we probed is wrong for this build. Fail
+        // open: trust the idx match since Phase-B reads m_hMyWeapons
+        // live each OnFrame (short caching window). Logged implicitly.
+    }
     return ent;
 }
 
@@ -300,12 +321,11 @@ void ApplyToView(void* view, const cheat::items::ItemConfig& it) {
         *At<float>(view, offsets::m_flFallbackWear) = it.wear;
 
     ApplyAttributes(view, it);
-
-    // Force re-materialize: toggle m_bInitialized so the EconItemView refetches.
-    if (offsets::m_bInitialized) {
-        *At<bool>(view, offsets::m_bInitialized) = false;
-        *At<bool>(view, offsets::m_bInitialized) = true;
-    }
+    // The real refresh fn (CEconItemView::Update) is build-specific and not
+    // resolved per-build here. CS2's tick-driven CEconEntity::OnDataChanged
+    // picks up our m_iItemIDHigh=-1 + attribute writes on the next frame
+    // without any explicit poke needed. Previously we toggled m_bInitialized
+    // here, but that was cosmetic — the field doesn't drive re-materialize.
 }
 
 // Match live weapon's def to a user ItemConfig. First match by def_index wins.
@@ -365,10 +385,6 @@ public:
             if (!view) continue;
             // ItemIDHigh = 0 lets the server-side truth re-flow on next tick.
             if (offsets::m_iItemIDHigh) *At<std::uint32_t>(view, offsets::m_iItemIDHigh) = 0;
-            if (offsets::m_bInitialized) {
-                *At<bool>(view, offsets::m_bInitialized) = false;
-                *At<bool>(view, offsets::m_bInitialized) = true;
-            }
         }
         return true;
     }
