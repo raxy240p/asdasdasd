@@ -9,12 +9,14 @@ namespace {
 std::mutex          g_mx;
 std::vector<Entry>  g_entries;
 
-void WritePatch(void* dst, const std::uint8_t* src, size_t n) {
-    DWORD old;
-    VirtualProtect(dst, n, PAGE_EXECUTE_READWRITE, &old);
+bool WritePatch(void* dst, const std::uint8_t* src, size_t n) {
+    DWORD old = 0;
+    if (!VirtualProtect(dst, n, PAGE_EXECUTE_READWRITE, &old)) return false;
     std::memcpy(dst, src, n);
-    VirtualProtect(dst, n, old, &old);
+    DWORD tmp = 0;
+    VirtualProtect(dst, n, old, &tmp);
     FlushInstructionCache(GetCurrentProcess(), dst, n);
+    return true;
 }
 } // namespace
 
@@ -24,7 +26,9 @@ bool Install(const std::string& name, void* target,
     std::lock_guard<std::mutex> _(g_mx);
     Entry e{ name, target, std::vector<std::uint8_t>(patch.size()), trampoline, true };
     std::memcpy(e.original.data(), target, patch.size());
-    WritePatch(target, patch.data(), patch.size());
+    // If VirtualProtect fails here, the detour never gets installed — don't
+    // record a bogus entry.
+    if (!WritePatch(target, patch.data(), patch.size())) return false;
     g_entries.push_back(std::move(e));
     return true;
 }

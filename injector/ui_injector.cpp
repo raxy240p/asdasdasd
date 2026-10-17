@@ -100,12 +100,8 @@ std::vector<std::uint8_t> ReadFileBytes(const std::filesystem::path& p) {
     return { std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>() };
 }
 
-// Finds cheat.dll next to the running exe.
 std::filesystem::path DefaultDllPath() {
-    wchar_t self[MAX_PATH];
-    GetModuleFileNameW(nullptr, self, MAX_PATH);
-    std::filesystem::path p(self);
-    return p.parent_path() / L"cheat.dll";
+    return randomize::CheatDllPathForThisRun();
 }
 
 enum class Stage { Scanning, AcBlocked, WaitingCS2, Injecting,
@@ -201,7 +197,11 @@ int Run(HINSTANCE hInst) {
     State S;
     auto lastPoll = std::chrono::steady_clock::now();
     S.ac = ac::ScanProcesses(true);
-    S.steamCheckedOnce = true;
+    // Only mark the Steam gate as satisfied once Steam was actually clear.
+    // Audit catch: previously set unconditionally, meaning a user who
+    // launched the loader with Steam running had the Steam row silently
+    // dropped on the next poll and INJECT re-enabled.
+    S.steamCheckedOnce = ac::AllClear(S.ac);
     S.stage = ac::AllClear(S.ac) ? Stage::WaitingCS2 : Stage::AcBlocked;
 
     bool quit = false;
@@ -234,11 +234,14 @@ int Run(HINSTANCE hInst) {
             lastPoll = now;
             if (S.stage == Stage::AcBlocked || S.stage == Stage::WaitingCS2) {
                 S.ac = ac::ScanProcesses(/*checkSteam*/ !S.steamCheckedOnce);
-                // Steam row is checked only once; drop it on subsequent polls.
                 if (S.steamCheckedOnce) {
                     S.ac.erase(std::remove_if(S.ac.begin(), S.ac.end(),
                         [](const ac::Status& s){ return s.family == ac::Family::Steam; }),
                         S.ac.end());
+                } else {
+                    // Still watching for Steam; mark the gate satisfied only
+                    // once Steam is actually clear.
+                    if (ac::AllClear(S.ac)) S.steamCheckedOnce = true;
                 }
                 if (!ac::AllClear(S.ac)) S.stage = Stage::AcBlocked;
                 else if (S.stage == Stage::AcBlocked) S.stage = Stage::WaitingCS2;
@@ -273,15 +276,26 @@ int Run(HINSTANCE hInst) {
         }
 
         ImGui::Separator();
+        // RECHECK is only meaningful before injection. During Watching we must
+        // not reset the stage without first closing the cs2 handle (handle
+        // leak + orphaned watcher per audit).
+        const bool canRecheck =
+            S.stage == Stage::AcBlocked || S.stage == Stage::WaitingCS2 ||
+            S.stage == Stage::Fail;
+        if (!canRecheck) ImGui::BeginDisabled();
         if (ImGui::Button("RECHECK", {120, 28})) {
             S.ac = ac::ScanProcesses(!S.steamCheckedOnce);
             if (S.steamCheckedOnce) {
                 S.ac.erase(std::remove_if(S.ac.begin(), S.ac.end(),
                     [](const ac::Status& s){ return s.family == ac::Family::Steam; }),
                     S.ac.end());
+            } else if (ac::AllClear(S.ac)) {
+                S.steamCheckedOnce = true;
             }
             S.stage = ac::AllClear(S.ac) ? Stage::WaitingCS2 : Stage::AcBlocked;
+            S.failMsg.clear();
         }
+        if (!canRecheck) ImGui::EndDisabled();
         ImGui::SameLine();
 
         const bool canInject =
@@ -289,6 +303,11 @@ int Run(HINSTANCE hInst) {
             (S.stage == Stage::WaitingCS2 || S.stage == Stage::Fail);
         if (!canInject) ImGui::BeginDisabled();
         if (ImGui::Button("INJECT", {160, 28})) {
+            // Fresh attempt — clear stale state. If an earlier INJECT reached
+            // Watching and then went Fail (couldn't open SYNCHRONIZE), close
+            // the dangling handle before overwriting it.
+            if (S.watchHandle) { CloseHandle(S.watchHandle); S.watchHandle = nullptr; }
+            S.failMsg.clear();
             S.stage = Stage::Injecting;
             S.cheatDllPath = DefaultDllPath();
             LogLine("reading cheat.dll...");
@@ -345,6 +364,13 @@ int Run(HINSTANCE hInst) {
         g_dx.sc->Present(1, 0);
     }
 
+    // If the user closed the loader WHILE we were watching cs2, do the same
+    // cleanup the watch-fire path does — otherwise cheat.dll + the staged
+    // exe both sit in %TEMP%\<rand>\ as breadcrumbs forever.
+    if (S.watchHandle && S.stage == Stage::Watching) {
+        DeleteWithRetry(S.cheatDllPath);
+        SelfDestructOnExit();
+    }
     if (S.watchHandle) { CloseHandle(S.watchHandle); S.watchHandle = nullptr; }
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

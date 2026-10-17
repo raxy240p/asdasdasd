@@ -15,6 +15,10 @@
 #include <windows.h>
 #include <filesystem>
 
+#ifdef SK_VAC_RECON
+namespace cheat::opsec::recon { void Init(); void Shutdown(); }
+#endif
+
 extern "C" __declspec(dllexport) ipc::Block g_ipc = {
     ipc::kMagic, ipc::kVersion,
     static_cast<uint32_t>(ipc::State::Boot),
@@ -42,19 +46,25 @@ void Boot() {
     cheat::menu::Init(ConfigDir());
 
     g_ipc.state = static_cast<uint32_t>(ipc::State::HookingDX);
-    cheat::hooks::InstallPresent(); // Present + ResizeBuffers + first-frame WndProc
-
-    // sk_init returns; the Present hook will flip state to Ready/Degraded on the
-    // first frame it runs (after the game device is adopted).
+    const bool ok = cheat::hooks::InstallPresent();
+    if (!ok) {
+        g_ipc.state = static_cast<uint32_t>(ipc::State::Fatal);
+        return; // no renderer host — the module stays silent, injector surfaces
+    }
+#ifdef SK_VAC_RECON
+    cheat::opsec::recon::Init();
+#endif
+    // Present hook flips state to Ready/Degraded on the first frame.
 }
 
 void Teardown() {
-    // Pull the WndProc subclass first — any in-flight message landing on a
-    // detached subclass would call unloaded code.
     cheat::hooks::UninstallWndProcSubclass();
+#ifdef SK_VAC_RECON
+    cheat::opsec::recon::Shutdown();  // drain in-flight recon detours
+#endif
     cheat::hooks::UninstallPresent();
-    // Give any in-flight Present detour a chance to finish before DX11
-    // shutdown tears down the context ImGui is still using.
+    // Spin until the Present detour isn't mid-body. The flag is set as the
+    // first act of the detour, so this catches threads already past the jmp.
     for (int i = 0; i < 50 && cheat::hooks::PresentInFlight(); ++i) Sleep(2);
     cheat::menu::Shutdown();
     cheat::render::Shutdown();

@@ -50,9 +50,11 @@ void ScanOnce() {
         for (std::size_t off = 0; off + kStub <= n; ++off) {
             if ((reinterpret_cast<std::uintptr_t>(p + off) & (kAlign - 1)) != 0) continue;
             bool ok = true;
+            // Scan only runs of int3 (0xCC). Mixing in 0x90 (NOP) would mean
+            // we'd have to remember per-slot which byte to restore. Int3-only
+            // keeps cleanup trivially correct and still gives plenty of caves.
             for (std::size_t k = 0; k < kStub; ++k) {
-                std::uint8_t b = p[off + k];
-                if (b != 0xCC && b != 0x90) { ok = false; break; }
+                if (p[off + k] != 0xCC) { ok = false; break; }
             }
             if (ok) {
                 g_pool.free.push_back(p + off);
@@ -80,10 +82,17 @@ void* MakeGateToClient(void* realFn) {
     };
     std::memcpy(stub + 2, &realFn, 8);
 
-    DWORD old;
-    VirtualProtect(dst, kStubSize, PAGE_EXECUTE_READWRITE, &old);
+    DWORD old = 0;
+    if (!VirtualProtect(dst, kStubSize, PAGE_EXECUTE_READWRITE, &old)) {
+        // Reinsert the slot and bail — never write to a page whose protection
+        // we couldn't read first.
+        g_pool.free.push_back(dst);
+        g_pool.used.pop_back();
+        return nullptr;
+    }
     std::memcpy(dst, stub, kStubSize);
-    VirtualProtect(dst, kStubSize, old, &old);
+    DWORD tmp = 0;
+    VirtualProtect(dst, kStubSize, old, &tmp);
     FlushInstructionCache(GetCurrentProcess(), dst, kStubSize);
     return dst;
 }
@@ -100,10 +109,11 @@ void UnloadAllGates() {
     std::uint8_t cc[kStubSize];
     std::memset(cc, 0xCC, kStubSize);
     for (auto* dst : g_pool.used) {
-        DWORD old;
-        VirtualProtect(dst, kStubSize, PAGE_EXECUTE_READWRITE, &old);
+        DWORD old = 0;
+        if (!VirtualProtect(dst, kStubSize, PAGE_EXECUTE_READWRITE, &old)) continue;
         std::memcpy(dst, cc, kStubSize);
-        VirtualProtect(dst, kStubSize, old, &old);
+        DWORD tmp = 0;
+        VirtualProtect(dst, kStubSize, old, &tmp);
         FlushInstructionCache(GetCurrentProcess(), dst, kStubSize);
     }
     g_pool.used.clear();

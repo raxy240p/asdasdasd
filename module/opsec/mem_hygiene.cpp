@@ -10,15 +10,16 @@ namespace cheat::opsec {
 namespace {
 std::atomic<unsigned> g_mask{ 0 };
 
-// Address of our own module. Resolved via a cheap trick: use the address of
-// this translation-unit's function and query the backing region.
+// Address of our own module. Manual-mapped images are NOT in the LDR list,
+// so `GetModuleHandleEx(FROM_ADDRESS, &SelfModule)` returns null and the
+// erase silently no-ops. Walk the VM instead: VirtualQuery around any symbol
+// in this module reports the backing region's AllocationBase, which IS the
+// mapped image base regardless of LDR state.
 HMODULE SelfModule() {
-    HMODULE h = nullptr;
-    GetModuleHandleExW(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCWSTR>(&SelfModule), &h);
-    return h;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<LPCVOID>(&SelfModule), &mbi, sizeof(mbi)))
+        return nullptr;
+    return reinterpret_cast<HMODULE>(mbi.AllocationBase);
 }
 } // namespace
 

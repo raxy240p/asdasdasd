@@ -77,7 +77,9 @@ std::uint8_t* SigScan(HMODULE mod, const char* pattern) {
 // Prototype assumption: builder takes "this" + ptr-to-payload-struct. We don't
 // need the real signature — we only need to SuspendAll before invoking the
 // trampoline and ResumeAll after. The trampoline tail-calls the original.
-constexpr std::size_t kPatchLen = 14;
+// 5-byte E9 rel32 patch; trampoline tail is 14-byte abs jmp back.
+constexpr std::size_t kPatchLen  = 5;
+constexpr std::size_t kFarJmpLen = 14;
 
 struct Builder {
     void*                     target     = nullptr;
@@ -87,7 +89,17 @@ struct Builder {
 Builder g_fieldMonitor;
 Builder g_retTracker;
 
-void MakeFarJmp(std::uint8_t out[kPatchLen], std::uint64_t target) {
+bool Fits32(std::intptr_t d) { return d >= -0x80000000LL && d < 0x80000000LL; }
+
+void MakeRel32Jmp(std::uint8_t out[kPatchLen], void* from, void* to) {
+    const std::intptr_t rel =
+        reinterpret_cast<std::uint8_t*>(to) -
+        (reinterpret_cast<std::uint8_t*>(from) + kPatchLen);
+    out[0] = 0xE9;
+    std::memcpy(out + 1, &rel, 4);
+}
+
+void MakeFarJmp14(std::uint8_t out[kFarJmpLen], std::uint64_t target) {
     out[0] = 0xFF; out[1] = 0x25;
     out[2] = out[3] = out[4] = out[5] = 0x00;
     std::memcpy(out + 6, &target, 8);
@@ -97,10 +109,10 @@ void* BuildTrampoline(void* target) {
     void* mem = VirtualAlloc(nullptr, 0x40, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!mem) return nullptr;
     std::memcpy(mem, target, kPatchLen);
-    std::uint8_t jmp[kPatchLen];
-    MakeFarJmp(jmp,
+    std::uint8_t jmp[kFarJmpLen];
+    MakeFarJmp14(jmp,
         reinterpret_cast<std::uint64_t>(static_cast<std::uint8_t*>(target) + kPatchLen));
-    std::memcpy(static_cast<std::uint8_t*>(mem) + kPatchLen, jmp, kPatchLen);
+    std::memcpy(static_cast<std::uint8_t*>(mem) + kPatchLen, jmp, kFarJmpLen);
     DWORD old; VirtualProtect(mem, 0x40, PAGE_EXECUTE_READ, &old);
     return mem;
 }
@@ -121,8 +133,12 @@ std::uint64_t Wrap(const Builder& b,
     if (outer) cheat::hooks::SuspendAll();
     auto fn = reinterpret_cast<FnGeneric>(b.trampoline);
     std::uint64_t r = fn ? fn(a1, a2, a3, a4, a5, a6) : 0;
-    if (outer) cheat::hooks::ResumeAll();
+    // Decrement BEFORE Resume: ResumeAll re-arms hooks, so any thread that
+    // enters a sibling builder between Resume and decrement would see
+    // depth==1 (not outer), skip SuspendAll, and run with hooks live. The
+    // order was flipped in the earlier version — audit catch.
     g_depth.fetch_sub(1);
+    if (outer) cheat::hooks::ResumeAll();
     return r;
 }
 
@@ -140,13 +156,18 @@ bool InstallBuilder(Builder& b, HMODULE client, const char* sig, const char* nam
 {
     auto* fn = SigScan(client, sig);
     if (!fn) return false;
+    const std::intptr_t delta =
+        reinterpret_cast<std::intptr_t>(detour) -
+        reinterpret_cast<std::intptr_t>(fn);
+    if (!Fits32(delta)) return false;
+
     b.name   = name;
     b.target = fn;
     b.trampoline = BuildTrampoline(fn);
     if (!b.trampoline) return false;
 
     std::uint8_t patch[kPatchLen];
-    MakeFarJmp(patch, reinterpret_cast<std::uint64_t>(detour));
+    MakeRel32Jmp(patch, fn, detour);
     return cheat::hooks::Install(name, fn,
         std::vector<std::uint8_t>(patch, patch + kPatchLen), b.trampoline);
 }
@@ -189,6 +210,14 @@ void Init() {
                    "vac_ret_tracker",
                    reinterpret_cast<void*>(&RetTrackerDetour));
     ObserveVacProvider();
+}
+
+void Shutdown() {
+    // Drain in-flight builders before UninstallAll tears the detour bytes
+    // out from under them. g_depth is incremented at every detour entry.
+    for (int i = 0; i < 100 && g_depth.load() > 0; ++i) Sleep(2);
+    // Hooks are nuked by cheat::hooks::UninstallAll in dllmain Teardown,
+    // which runs after this. Nothing more to do here.
 }
 
 } // namespace cheat::opsec::recon

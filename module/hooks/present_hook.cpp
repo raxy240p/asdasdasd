@@ -32,60 +32,48 @@ ResizeBuffersFn g_origResize   = nullptr;
 
 std::atomic<bool> g_inPresent{ false };
 
-// 14-byte absolute JMP overwrite. We copy that many bytes into the
-// trampoline, append the far jump back. Before patching we scan the stolen
-// window with a conservative "prologue-safe" check (see IsStolenSafe) — any
-// RIP-relative addressing or short/near relative jump bails the install.
-// DXGI's Present / ResizeBuffers prologues are pure save-regs + stack
-// adjust, so this is almost always a clean copy — but we refuse to patch
-// an unsafe prologue rather than relocate it with a full LDE.
-constexpr std::size_t kPatchLen = 14;
+// 5-byte E9 rel32 hotpatch. Known DXGI Present/ResizeBuffers prologues
+// start with a complete 5-byte instruction (`48 89 5C 24 08` = mov [rsp+8],rbx),
+// so the stolen window never straddles. If the target lies beyond ±2GB of
+// our detour (rare for in-process DXGI), install fails cleanly instead of
+// relocating anything.
+//
+// The trampoline is still a stolen-prologue + 14-byte abs jmp back, which
+// IS allowed to live in private RX memory (it is called BY the game via our
+// rel32, so return addresses land in game code — no 164 trip on the game
+// side; our own code never calls the trampoline directly).
+constexpr std::size_t kPatchLen = 5;
 
-bool IsStolenSafe(const std::uint8_t* p) {
-    // Opcode byte → unsafe set we refuse to relocate.
-    for (std::size_t i = 0; i < kPatchLen; ) {
-        const std::uint8_t b = p[i];
+bool Fits32(std::intptr_t delta) {
+    return delta >= -0x80000000LL && delta < 0x80000000LL;
+}
 
-        // Short/near relative jumps and calls.
-        if (b == 0xE8 || b == 0xE9 || b == 0xEB) return false;
-        if (b >= 0x70 && b <= 0x7F)              return false; // short jcc
-        if (b == 0x0F && (i + 1) < kPatchLen) {
-            const std::uint8_t b2 = p[i + 1];
-            if (b2 >= 0x80 && b2 <= 0x8F)        return false; // near jcc rel32
-        }
-
-        // RIP-relative addressing: a ModR/M with (mod=00, rm=101) uses [RIP+disp32].
-        // Scanning for 0x05 ModR/M byte after a REX prefix is a quick heuristic:
-        // detect any mov/lea with mod=00 rm=101 (byte & 0xC7 == 0x05).
-        // Conservative: if the byte looks like a ModR/M with mod=00 rm=101
-        // and the preceding byte is in the common prefix set, bail.
-        if (i >= 1 && (b & 0xC7) == 0x05 &&
-            (p[i-1] == 0x8B || p[i-1] == 0x8D || p[i-1] == 0x89 ||
-             p[i-1] == 0xFF)) {
-            return false;
-        }
-
-        ++i;
-    }
-    return true;
+void MakeRel32Jmp(std::uint8_t out[kPatchLen], void* from, void* to) {
+    const std::intptr_t rel =
+        reinterpret_cast<std::uint8_t*>(to) -
+        (reinterpret_cast<std::uint8_t*>(from) + kPatchLen);
+    out[0] = 0xE9;
+    std::memcpy(out + 1, &rel, 4);
 }
 
 // 14-byte absolute JMP [RIP+0]; dq target
-void MakeFarJmp(std::uint8_t out[kPatchLen], std::uint64_t target) {
+// 14-byte absolute far-jmp used ONLY in the trampoline tail.
+constexpr std::size_t kFarJmpLen = 14;
+void MakeFarJmp14(std::uint8_t out[kFarJmpLen], std::uint64_t target) {
     out[0] = 0xFF; out[1] = 0x25;
     out[2] = out[3] = out[4] = out[5] = 0x00;
     std::memcpy(out + 6, &target, 8);
 }
 
-// Allocate an executable trampoline: original 14 bytes + 14-byte jmp back.
+// Trampoline = 5 stolen bytes + 14-byte abs-jmp back to (target + 5).
 void* BuildTrampoline(void* target) {
     void* mem = VirtualAlloc(nullptr, 0x40, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!mem) return nullptr;
     std::memcpy(mem, target, kPatchLen);
-    std::uint8_t jmp[kPatchLen];
-    MakeFarJmp(jmp,
+    std::uint8_t jmp[kFarJmpLen];
+    MakeFarJmp14(jmp,
         reinterpret_cast<std::uint64_t>(static_cast<std::uint8_t*>(target) + kPatchLen));
-    std::memcpy(static_cast<std::uint8_t*>(mem) + kPatchLen, jmp, kPatchLen);
+    std::memcpy(static_cast<std::uint8_t*>(mem) + kPatchLen, jmp, kFarJmpLen);
     DWORD old;
     VirtualProtect(mem, 0x40, PAGE_EXECUTE_READ, &old);
     return mem;
@@ -144,18 +132,25 @@ bool InstallPresent() {
     cheat::render::VTable vt;
     if (!cheat::render::ResolveSwapChainVTable(vt)) return false;
 
-    // Refuse to install on an unsafe prologue — see IsStolenSafe above.
-    if (!IsStolenSafe(reinterpret_cast<const std::uint8_t*>(vt.Present)) ||
-        !IsStolenSafe(reinterpret_cast<const std::uint8_t*>(vt.ResizeBuffers)))
-        return false;
+    // 5-byte rel32 requires target to be within ±2GB of the detour. For
+    // in-process DXGI patched by code in our mapped image, this is almost
+    // always true. If it isn't, bail — we don't quietly fall back to the
+    // 14-byte abs-jmp that straddles prologues.
+    const auto presentDelta =
+        reinterpret_cast<std::intptr_t>(&PresentDetour) -
+        reinterpret_cast<std::intptr_t>(vt.Present);
+    const auto resizeDelta =
+        reinterpret_cast<std::intptr_t>(&ResizeDetour) -
+        reinterpret_cast<std::intptr_t>(vt.ResizeBuffers);
+    if (!Fits32(presentDelta) || !Fits32(resizeDelta)) return false;
 
     std::uint8_t presentPatch[kPatchLen];
-    MakeFarJmp(presentPatch, reinterpret_cast<std::uint64_t>(&PresentDetour));
+    MakeRel32Jmp(presentPatch, vt.Present, reinterpret_cast<void*>(&PresentDetour));
     void* presentTramp = BuildTrampoline(vt.Present);
     if (!presentTramp) return false;
 
     std::uint8_t resizePatch[kPatchLen];
-    MakeFarJmp(resizePatch, reinterpret_cast<std::uint64_t>(&ResizeDetour));
+    MakeRel32Jmp(resizePatch, vt.ResizeBuffers, reinterpret_cast<void*>(&ResizeDetour));
     void* resizeTramp = BuildTrampoline(vt.ResizeBuffers);
     if (!resizeTramp) {
         VirtualFree(presentTramp, 0, MEM_RELEASE);

@@ -5,6 +5,7 @@
 
 #include <winternl.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <algorithm>
 #include <cstring>
 #include <string>
@@ -37,12 +38,32 @@ bool ParsePE(const std::vector<std::uint8_t>& bytes, Img& out) {
     out.raw = bytes.data();
     out.dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(out.raw);
     if (out.dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    if (bytes.size() < static_cast<size_t>(out.dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64))
+    if (out.dos->e_lfanew < 0 ||
+        static_cast<size_t>(out.dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > bytes.size())
         return false;
     out.nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(out.raw + out.dos->e_lfanew);
     if (out.nt->Signature != IMAGE_NT_SIGNATURE) return false;
     if (out.nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return false;
     if (out.nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+    // Section table + each section's raw range must sit inside the input.
+    const size_t secTblOff = static_cast<size_t>(out.dos->e_lfanew)
+        + offsetof(IMAGE_NT_HEADERS64, OptionalHeader)
+        + out.nt->FileHeader.SizeOfOptionalHeader;
+    const size_t secBytes  = static_cast<size_t>(out.nt->FileHeader.NumberOfSections)
+                             * sizeof(IMAGE_SECTION_HEADER);
+    if (secTblOff + secBytes > bytes.size()) return false;
+    auto* sec = reinterpret_cast<const IMAGE_SECTION_HEADER*>(out.raw + secTblOff);
+    for (WORD i = 0; i < out.nt->FileHeader.NumberOfSections; ++i) {
+        if (static_cast<size_t>(sec[i].PointerToRawData) + sec[i].SizeOfRawData > bytes.size())
+            return false;
+    }
+    // SizeOfImage must at least cover headers + every section's VirtualAddress+VirtualSize.
+    const DWORD imgSize = out.nt->OptionalHeader.SizeOfImage;
+    if (imgSize < out.nt->OptionalHeader.SizeOfHeaders) return false;
+    for (WORD i = 0; i < out.nt->FileHeader.NumberOfSections; ++i) {
+        if (static_cast<uint64_t>(sec[i].VirtualAddress) + sec[i].Misc.VirtualSize > imgSize)
+            return false;
+    }
     return true;
 }
 
@@ -314,9 +335,11 @@ ShimLayout BuildShim(std::uintptr_t base, std::uintptr_t entry, std::uintptr_t s
     emit({0x9D});                                // popfq
     emit({0x5D});                                // pop rbp
 
-    // --- jmp back to the exact saved RIP ---
-    emit({0x48, 0xB8}); emit64(static_cast<std::uint64_t>(savedRip));       // mov rax, imm64
-    emit({0xFF, 0xE0});                                                     // jmp rax
+    // --- jmp to exact saved RIP via RIP-relative absolute, NO GPR touched ---
+    // Encoding: FF 25 00 00 00 00  (jmp qword ptr [rip + 0])
+    // then 8 bytes holding the target address, inlined.
+    emit({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+    emit64(static_cast<std::uint64_t>(savedRip));
 
     sl.size = static_cast<std::size_t>(p - sl.bytes);
     return sl;
@@ -352,23 +375,30 @@ HANDLE OpenHijackableThread(DWORD pid, DWORD& outTid) {
     std::sort(cands.begin(), cands.end(),
               [](const Candidate& a, const Candidate& b) { return a.tid < b.tid; });
 
+    // Null every closed handle so the cleanup sweep doesn't double-close.
     for (auto& c : cands) {
-        if (SuspendThread(c.handle) == (DWORD)-1) { CloseHandle(c.handle); continue; }
+        if (SuspendThread(c.handle) == (DWORD)-1) {
+            CloseHandle(c.handle); c.handle = nullptr; continue;
+        }
         CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_CONTROL;
         if (!GetThreadContext(c.handle, &ctx)) {
-            ResumeThread(c.handle); CloseHandle(c.handle); continue;
+            ResumeThread(c.handle);
+            CloseHandle(c.handle); c.handle = nullptr; continue;
         }
         ResumeThread(c.handle);
         const auto rip = static_cast<std::uintptr_t>(ctx.Rip);
         if (rip >= ntBase && rip < ntEnd) {
-            // Parked in ntdll (likely NtWaitForSingleObject or similar).
-            CloseHandle(c.handle);
-            continue;
+            CloseHandle(c.handle); c.handle = nullptr; continue;
         }
-        // Winner — close the rest and return.
-        for (auto& r : cands) if (r.handle && r.tid != c.tid) CloseHandle(r.handle);
+        for (auto& r : cands) {
+            if (r.handle && r.tid != c.tid) {
+                CloseHandle(r.handle); r.handle = nullptr;
+            }
+        }
         outTid = c.tid;
-        return c.handle;
+        HANDLE winner = c.handle;
+        c.handle = nullptr;
+        return winner;
     }
     for (auto& r : cands) if (r.handle) CloseHandle(r.handle);
     outTid = 0;
@@ -489,11 +519,15 @@ Result Inject(DWORD pid,
         }
     }
 
-    // Resolve module entry: prefer sk_init, fall back to DllMain via AddressOfEntryPoint.
-    std::uintptr_t entry = FindExport(local.data(),
-        reinterpret_cast<const IMAGE_NT_HEADERS64*>(local.data() + img.dos->e_lfanew),
-        remoteBase, "sk_init");
-    if (!entry) entry = remoteBase + img.nt->OptionalHeader.AddressOfEntryPoint;
+    // Entry = AddressOfEntryPoint (__DllMainCRTStartup). The CRT entry does:
+    //   - CRT init + global ctors
+    //   - TLS callback dispatch (_tls_used)
+    //   - RtlAddFunctionTable for x64 unwind registration
+    // Then it calls our DllMain, which calls sk_init(). Skipping the CRT entry
+    // leaves all three undone (per audit). Keep the sk_init export only as a
+    // public symbol for debugging; the shim always goes through CRT.
+    std::uintptr_t entry = remoteBase + img.nt->OptionalHeader.AddressOfEntryPoint;
+    (void)FindExport; // kept available for diagnostics
 
     // Allocate a tiny RX scratch for the hijack shim OUTSIDE the module.
     // Lives in cs2.exe's address space as RX. Freed after return.

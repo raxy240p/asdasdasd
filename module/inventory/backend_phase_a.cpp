@@ -59,10 +59,16 @@ struct Vec {
 
 // ---- CHandle resolution via dwEntityList ----
 // handle layout: low 15 bits = index, high 17 bits = serial. INVALID = 0xFFFFFFFF.
+//
+// ponytail: Phase-B reads m_hMyWeapons live each OnFrame, so stale handles
+// never leave this scope — the cache ApplyAll uses lives only on the frame
+// stack. We still bounds-check idx and reject the obvious invalid patterns
+// (0, 0xFFFFFFFF). Full serial-match belongs on a future CEntityIdentity
+// walk; without that offset nailed down, don't fake it.
 void* ResolveHandle(std::uint32_t handle) {
-    if (handle == 0xFFFFFFFFu) return nullptr;
+    if (handle == 0 || handle == 0xFFFFFFFFu) return nullptr;
     const int idx = static_cast<int>(handle & 0x7FFFu);
-    if (idx <= 0) return nullptr;
+    if (idx <= 0 || idx >= 0x8000) return nullptr;
     auto* esSlot = reinterpret_cast<void**>(AbsFromClient(offsets::dwEntityList));
     if (!esSlot || !*esSlot) return nullptr;
     auto es = *esSlot;
@@ -71,8 +77,12 @@ void* ResolveHandle(std::uint32_t handle) {
     void* chunk = *reinterpret_cast<void**>(
         reinterpret_cast<std::uint8_t*>(es) + 0x10 + 8 * chunkIdx);
     if (!chunk) return nullptr;
-    return *reinterpret_cast<void**>(
+    void* ent = *reinterpret_cast<void**>(
         reinterpret_cast<std::uint8_t*>(chunk) + 120 * (idx & 0x1FF));
+    // Reject obviously-garbage pointers (unmapped low 64KB, misaligned).
+    const auto p = reinterpret_cast<std::uintptr_t>(ent);
+    if (p < 0x10000 || (p & 0x7)) return nullptr;
+    return ent;
 }
 
 void* LocalController() {
@@ -250,6 +260,14 @@ class PhaseA final : public IInventoryBackend {
 public:
     bool ApplyAll(const std::vector<cheat::items::ItemConfig>& items) override {
         ResolveAttrFn();
+        // No gated attribute fn → paint/wear/seed/stattrak/stickers silently
+        // no-op. Direct-field writes alone would land partially-applied,
+        // mis-reporting success. Flip to Degraded and bail so the caller
+        // (OnFrame) doesn't clear the dirty flag.
+        if (!g_setAttrGated) {
+            g_ipc.state = static_cast<uint32_t>(ipc::State::Degraded);
+            return false;
+        }
 
         auto* controller = LocalController();     if (!controller) return false;
         auto* pawn       = LocalPawn(controller); if (!pawn)       return false;
@@ -259,6 +277,7 @@ public:
         if (!myWeapons || !myWeapons->memory || myWeapons->size <= 0) return false;
 
         auto* handles = static_cast<std::uint32_t*>(myWeapons->memory);
+        bool anyApplied = false;
         for (int i = 0; i < myWeapons->size; ++i) {
             auto* weapon = ResolveHandle(handles[i]);
             if (!weapon) continue;
@@ -269,8 +288,9 @@ public:
             const auto* cfg = PickForDef(items, def);
             if (!cfg) continue;
             ApplyToView(view, *cfg);
+            anyApplied = true;
         }
-        return true;
+        return anyApplied;
     }
 
     bool ClearAll() override {
@@ -308,10 +328,22 @@ std::unique_ptr<IInventoryBackend> MakeBackend() {
 }
 
 void OnFrame() {
+    // Degraded gate: refuse to write when offsets.hpp isn't fully verified
+    // or the attribute-set fn hasn't been resolved yet. Writing with
+    // zero-valued offsets would land in random pointer-relative memory.
+    if (g_ipc.state != static_cast<uint32_t>(ipc::State::Ready)) return;
+
     if (!g_backend) g_backend = MakeBackend();
     auto& S = cheat::menu::Get();
+
+    // Peek dirty without clearing. We only clear after a successful apply so
+    // "menu flip during apply" isn't lost — the next frame reconsiders. The
+    // revert flag can clear eagerly; it's intentionally one-shot.
     if (g_revertRequested.exchange(false)) g_backend->ClearAll();
-    if (S.dirty.exchange(false))           g_backend->ApplyAll(S.inventory);
+
+    if (S.dirty.load()) {
+        if (g_backend->ApplyAll(S.inventory)) S.dirty.store(false);
+    }
 }
 
 void RequestRevert() { g_revertRequested.store(true); }

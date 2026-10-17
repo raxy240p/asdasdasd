@@ -16,9 +16,14 @@ std::filesystem::path MakeStagingPath();
 // exits cleanly on success. Returns true when we're already the staged copy.
 bool SelfRelaunchAndMelt();
 
-// Call once from WinMain on the staged copy. If the cmdline contains
-// `--melt <path>`, delete <path> (with brief retries while the parent closes).
+// Call once from WinMain on the staged copy. Deletes everything flagged with
+// `--melt <path>` or `--meltDll <path>` on the cmdline (with brief retries
+// while the parent closes).
 bool DeleteSelfOrigFromCmdLine();
+
+// Where this run should look for cheat.dll. Staged copies find it next to
+// the staged exe (SelfRelaunchAndMelt copies both there).
+std::filesystem::path CheatDllPathForThisRun();
 
 // Window identity: title/class randomized per launch. Both strings persist
 // for the lifetime of the process so SetWindowText / RegisterClassW agree.
