@@ -63,12 +63,17 @@ inline constexpr std::ptrdiff_t m_iAccountID               = 0x1D8;
 inline constexpr std::ptrdiff_t m_szCustomName             = 0x2F8;
 inline constexpr std::ptrdiff_t m_bInitialized             = 0x1E8;
 
-// Attribute list — the CS2 way to override paint kit / wear / seed / stattrak.
-// CSGO's m_nFallbackPaintKit etc. do not exist on this build; attributes
-// are injected via CAttributeList::SetOrAddAttributeValueByName. Phase-B uses
-// these two bases to write per-attribute entries.
-inline constexpr std::ptrdiff_t m_AttributeList              = 0x208; // CAttributeList
-inline constexpr std::ptrdiff_t m_NetworkedDynamicAttributes = 0x280; // CAttributeList
+// Attribute list — paint/wear/seed/stattrak go through CAttributeList, not
+// through dead CSGO fallback fields. Pulled from cs2-dumper:
+//   CAttributeList::m_Attributes = 0x8   (CNetworkUtlVectorBase<CEconItemAttribute>)
+//   CEconItemAttribute::m_iAttributeDefinitionIndex = 0x30
+//   CEconItemAttribute::m_flValue                   = 0x34
+inline constexpr std::ptrdiff_t m_AttributeList              = 0x208; // on CEconItemView
+inline constexpr std::ptrdiff_t m_NetworkedDynamicAttributes = 0x280; // on CEconItemView
+inline constexpr std::ptrdiff_t AttrList_m_Attributes        = 0x08;  // on CAttributeList
+inline constexpr std::ptrdiff_t Attr_m_iAttributeDefinitionIndex = 0x30; // on CEconItemAttribute
+inline constexpr std::ptrdiff_t Attr_m_flValue                  = 0x34;
+inline constexpr std::size_t    Attr_sizeof                     = 0x38; // layout stride
 
 // CSGO fallback fields — kept for symmetry with Appendix B. All zero on CS2.
 inline constexpr std::ptrdiff_t m_nFallbackPaintKit        = 0x0;
@@ -76,42 +81,26 @@ inline constexpr std::ptrdiff_t m_nFallbackSeed            = 0x0;
 inline constexpr std::ptrdiff_t m_flFallbackWear           = 0x0;
 inline constexpr std::ptrdiff_t m_nFallbackStatTrak        = 0x0;
 
-// Attribute name hashes used by SetOrAddAttributeValueByName.
-// Hashes are stable across CS2 builds (cheat-public knowledge).
-inline constexpr std::uint32_t kAttr_PaintKit        = 0x79'F3'3F'F0u; // "set item texture prefab"
-inline constexpr std::uint32_t kAttr_Wear            = 0xF6'62'5E'1Fu; // "set item texture wear"
-inline constexpr std::uint32_t kAttr_Seed            = 0x4E'B2'51'4Du; // "set item texture seed"
-inline constexpr std::uint32_t kAttr_StatTrak        = 0x2E'10'34'20u; // "kill eater"
-inline constexpr std::uint32_t kAttr_StatTrakType    = 0xA1'B2'C9'B3u; // "kill eater score type"
+// Attribute DEFINITION indexes (items_game.txt). CS2 kept CSGO's numbering
+// for the common fields; refresh after a schema break by cross-checking
+// scripts/items/items_game.txt in GameTracking-CS2.
+inline constexpr std::uint16_t kAttrDef_PaintKit     = 6;   // "set item texture prefab"
+inline constexpr std::uint16_t kAttrDef_Seed         = 7;   // "set item texture seed"
+inline constexpr std::uint16_t kAttrDef_Wear         = 8;   // "set item texture wear"
+inline constexpr std::uint16_t kAttrDef_StatTrak     = 80;  // "kill eater"
+inline constexpr std::uint16_t kAttrDef_StatTrakType = 81;  // "kill eater score type"
+inline constexpr std::uint16_t kAttrDef_CustomName   = 111; // "custom name attr"
+// Sticker slot block (per-slot stride 4; slot 0 occupies 113..116).
+inline constexpr std::uint16_t kAttrDef_StickerSlotBase = 113;
 
-// ---- stickers / charm (keychain) attachment layout ----
-// Dumper doesn't expose sticker slot bases directly on EconItemView; they
-// come through attributes "sticker slot %i id/wear/scale/rotation" too.
-// Keeping these as 0 means Phase-B uses the attribute path for stickers.
-inline constexpr std::ptrdiff_t m_stickerSlots             = 0x0;
-inline constexpr std::ptrdiff_t m_charmSlot                = 0x0;
-inline constexpr std::size_t    kStickerSlotStride         = 0x0;
-inline constexpr std::size_t    kStickerSlotCount          = 5;
-inline constexpr std::ptrdiff_t stkr_id                    = 0x0;
-inline constexpr std::ptrdiff_t stkr_wear                  = 0x0;
-inline constexpr std::ptrdiff_t stkr_scale                 = 0x0;
-inline constexpr std::ptrdiff_t stkr_rotation              = 0x0;
-
-// Sticker attribute name hashes.
-inline constexpr std::uint32_t kAttr_StickerId[5] = {
-    0xC5'C1'8D'BAu, 0xB8'B4'D9'E9u, 0xDB'A7'59'0Au, 0xE5'15'7D'A3u, 0x1C'90'2B'8Fu
-};
-inline constexpr std::uint32_t kAttr_StickerWear[5] = {
-    0xBE'5B'5A'A3u, 0x8F'F5'51'8Du, 0xCF'5B'69'8Fu, 0x80'EA'8B'F6u, 0x27'5D'E4'77u
-};
-inline constexpr std::uint32_t kAttr_StickerScale[5] = {
-    0x95'A5'F1'EBu, 0xD3'04'69'69u, 0x7F'46'1A'EFu, 0x55'1A'A6'C4u, 0xB9'C3'A2'A2u
-};
-inline constexpr std::uint32_t kAttr_StickerRotation[5] = {
-    0xD4'70'FA'29u, 0x56'E6'51'0Au, 0x7E'65'B0'4Du, 0x2A'69'82'A4u, 0xB4'94'FA'36u
-};
-inline constexpr std::uint32_t kAttr_CharmId         = 0x6E'E0'C4'38u; // "keychain slot 0 id"
-inline constexpr std::uint32_t kAttr_CharmPattern    = 0x7F'27'8D'0Au; // "keychain slot 0 pattern"
+// Sticker slot count is fixed; attribute-driven path uses kAttrDef_StickerSlotBase.
+inline constexpr std::size_t   kStickerSlotCount = 5;
+// Per-slot sub-attribute offsets within the slot block.
+enum : std::uint16_t { kStk_Id = 0, kStk_Wear = 1, kStk_Scale = 2, kStk_Rotation = 3 };
+// Charm (CS2 keychain) uses a different attribute surface; needs reversing
+// confirmation per build. Left as placeholder def-indexes.
+inline constexpr std::uint16_t kAttrDef_CharmId      = 0;   // TODO verify
+inline constexpr std::uint16_t kAttrDef_CharmPattern = 0;   // TODO verify
 
 // ---- gloves ----
 // Dumper exposes C_CSPlayerPawn::m_EconGloves (embedded C_EconItemView).

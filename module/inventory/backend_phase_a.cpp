@@ -109,13 +109,19 @@ void* ItemViewFromWeapon(void* weapon) {
     return attrMgr + offsets::m_Item;
 }
 
-// ---- SetOrAddAttributeValueByName: resolve by signature once ----
+// ---- SetOrAddAttributeValueByDefIndex (uint16 def-index, float value) ----
+// Picked by the AOB in signatures.hpp; the trailing `movzx r,r16` is the
+// def-index read. If the sig fails to resolve we fall back to walking the
+// CNetworkUtlVectorBase directly and updating existing entries only.
 using FnSetAttr = void(__fastcall*)(void* /*CAttributeList*/,
-                                    std::uint32_t /*hash*/, float /*value*/);
-FnSetAttr g_setAttr        = nullptr;
-FnSetAttr g_setAttrGated   = nullptr;
+                                    std::uint16_t /*defIdx*/, float /*value*/);
+FnSetAttr g_setAttr      = nullptr;
+FnSetAttr g_setAttrGated = nullptr;
 
 // Compact byte-pattern scanner. "48 89 5C 24 ? ..." style, '?' = wildcard byte.
+// Walks only readable + executable sections of the module; discarded or
+// uncommitted regions are skipped via VirtualQuery before touching them so
+// a bad import directory / stripped debug section can't AV the scanner.
 std::uint8_t* SigScan(HMODULE mod, const char* pattern) {
     if (!mod || !pattern || !*pattern) return nullptr;
 
@@ -134,21 +140,46 @@ std::uint8_t* SigScan(HMODULE mod, const char* pattern) {
         int lo = hex(*p++); if (lo < 0) continue;
         bytes.push_back((hi << 4) | lo);
     }
+    const std::size_t n = bytes.size();
+    if (n == 0) return nullptr;
 
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
     auto* nt  = reinterpret_cast<IMAGE_NT_HEADERS64*>(
                     reinterpret_cast<std::uint8_t*>(mod) + dos->e_lfanew);
     auto* base = reinterpret_cast<std::uint8_t*>(mod);
-    const auto size = nt->OptionalHeader.SizeOfImage;
 
-    const std::size_t n = bytes.size();
-    for (std::size_t i = 0; i + n <= size; ++i) {
-        bool ok = true;
-        for (std::size_t k = 0; k < n; ++k) {
-            if (bytes[k] < 0) continue;
-            if (base[i + k] != static_cast<std::uint8_t>(bytes[k])) { ok = false; break; }
+    constexpr DWORD kReadable =
+        PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+
+    // Only scan executable sections of the module.
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD si = 0; si < nt->FileHeader.NumberOfSections; ++si) {
+        if (!(sec[si].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        auto* p = base + sec[si].VirtualAddress;
+        const std::size_t sz = sec[si].Misc.VirtualSize;
+        for (std::size_t i = 0; i + n <= sz; ) {
+            // Probe current page's readability.
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(p + i, &mbi, sizeof(mbi))) break;
+            const bool readable = (mbi.State == MEM_COMMIT) &&
+                                  (mbi.Protect & kReadable) &&
+                                  !(mbi.Protect & PAGE_GUARD);
+            if (!readable) {
+                // Skip past this region.
+                const auto skip = reinterpret_cast<std::uint8_t*>(mbi.BaseAddress)
+                                + mbi.RegionSize - p;
+                i = (skip > 0) ? static_cast<std::size_t>(skip) : (i + 0x1000);
+                continue;
+            }
+            bool ok = true;
+            for (std::size_t k = 0; k < n; ++k) {
+                if (bytes[k] < 0) continue;
+                if (p[i + k] != static_cast<std::uint8_t>(bytes[k])) { ok = false; break; }
+            }
+            if (ok) return p + i;
+            ++i;
         }
-        if (ok) return base + i;
     }
     return nullptr;
 }
@@ -167,12 +198,36 @@ void ResolveAttrFn() {
         cheat::opsec::MakeGateToClient(reinterpret_cast<void*>(fn)));
 }
 
-void SetAttr(void* attrList, std::uint32_t hash, float value) {
+// Walk CAttributeList.m_Attributes directly; update existing entry if the
+// def-index already lives there. Returns true on in-place update.
+bool UpdateExistingAttr(void* attrList, std::uint16_t defIdx, float value) {
+    if (!attrList) return false;
+    // The CNetworkUtlVectorBase<CEconItemAttribute> starts at
+    // AttrList_m_Attributes; its first 24 bytes mirror CUtlVector layout.
+    auto* v = At<Vec>(attrList, offsets::AttrList_m_Attributes);
+    if (!v || !v->memory || v->size <= 0) return false;
+    auto* arr = reinterpret_cast<std::uint8_t*>(v->memory);
+    for (int i = 0; i < v->size; ++i) {
+        auto* ent = arr + i * offsets::Attr_sizeof;
+        const std::uint16_t d =
+            *reinterpret_cast<std::uint16_t*>(ent + offsets::Attr_m_iAttributeDefinitionIndex);
+        if (d == defIdx) {
+            *reinterpret_cast<float*>(ent + offsets::Attr_m_flValue) = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+void SetAttr(void* attrList, std::uint16_t defIdx, float value) {
     if (!attrList) return;
-    // VAC rule: never let our outbound RIP fall on an anonymous page.
-    // Gated pointer only; raw ungated resolution is a dev-only diagnostic.
+    // In-place first — works on existing attributes and doesn't need the
+    // resolved function pointer. This covers the common case.
+    if (UpdateExistingAttr(attrList, defIdx, value)) return;
+    // Append path needs the real fn (append grows the vector + fixes up
+    // network state handler). VAC rule: gated pointer only, never raw.
     if (!g_setAttrGated) return;
-    g_setAttrGated(attrList, hash, value);
+    g_setAttrGated(attrList, defIdx, value);
 }
 
 float Bits(std::uint32_t u) {
@@ -184,32 +239,36 @@ float Bits(std::uint32_t u) {
 // as integer-coerced floats go through the memcpy helper.
 void ApplyAttributes(void* view, const cheat::items::ItemConfig& it) {
     void* attrList = At<std::uint8_t>(view, offsets::m_AttributeList);
-    if (!attrList) return;
 
-    SetAttr(attrList, offsets::kAttr_PaintKit,
+    // Paint / wear / seed / stattrak (CSGO legacy numbering carried over).
+    SetAttr(attrList, offsets::kAttrDef_PaintKit,
             Bits(static_cast<std::uint32_t>(it.paintKit)));
-    SetAttr(attrList, offsets::kAttr_Wear,     it.wear);
-    SetAttr(attrList, offsets::kAttr_Seed,
+    SetAttr(attrList, offsets::kAttrDef_Wear, it.wear);
+    SetAttr(attrList, offsets::kAttrDef_Seed,
             Bits(static_cast<std::uint32_t>(it.seed)));
     if (it.statTrak >= 0) {
-        SetAttr(attrList, offsets::kAttr_StatTrak,
+        SetAttr(attrList, offsets::kAttrDef_StatTrak,
                 Bits(static_cast<std::uint32_t>(it.statTrak)));
-        SetAttr(attrList, offsets::kAttr_StatTrakType, Bits(0));
+        SetAttr(attrList, offsets::kAttrDef_StatTrakType, Bits(0));
     }
 
-    for (std::size_t s = 0; s < offsets::kStickerSlotCount; ++s) {
+    // Sticker slot block: base + slot*4 + {id, wear, scale, rotation}.
+    for (std::uint16_t s = 0; s < offsets::kStickerSlotCount; ++s) {
         const auto& sl = it.stickers[s];
-        SetAttr(attrList, offsets::kAttr_StickerId[s],
+        const std::uint16_t base = offsets::kAttrDef_StickerSlotBase + s * 4;
+        SetAttr(attrList, base + offsets::kStk_Id,
                 Bits(static_cast<std::uint32_t>(sl.stickerId)));
-        SetAttr(attrList, offsets::kAttr_StickerWear[s],     sl.wear);
-        SetAttr(attrList, offsets::kAttr_StickerScale[s],    sl.scale);
-        SetAttr(attrList, offsets::kAttr_StickerRotation[s], sl.rotation);
+        SetAttr(attrList, base + offsets::kStk_Wear,     sl.wear);
+        SetAttr(attrList, base + offsets::kStk_Scale,    sl.scale);
+        SetAttr(attrList, base + offsets::kStk_Rotation, sl.rotation);
     }
 
-    SetAttr(attrList, offsets::kAttr_CharmId,
-            Bits(static_cast<std::uint32_t>(it.charm.charmId)));
-    SetAttr(attrList, offsets::kAttr_CharmPattern,
-            Bits(static_cast<std::uint32_t>(it.charm.pattern)));
+    if (offsets::kAttrDef_CharmId) {
+        SetAttr(attrList, offsets::kAttrDef_CharmId,
+                Bits(static_cast<std::uint32_t>(it.charm.charmId)));
+        SetAttr(attrList, offsets::kAttrDef_CharmPattern,
+                Bits(static_cast<std::uint32_t>(it.charm.pattern)));
+    }
 }
 
 void ApplyToView(void* view, const cheat::items::ItemConfig& it) {
@@ -260,14 +319,10 @@ class PhaseA final : public IInventoryBackend {
 public:
     bool ApplyAll(const std::vector<cheat::items::ItemConfig>& items) override {
         ResolveAttrFn();
-        // No gated attribute fn → paint/wear/seed/stattrak/stickers silently
-        // no-op. Direct-field writes alone would land partially-applied,
-        // mis-reporting success. Flip to Degraded and bail so the caller
-        // (OnFrame) doesn't clear the dirty flag.
-        if (!g_setAttrGated) {
-            g_ipc.state = static_cast<uint32_t>(ipc::State::Degraded);
-            return false;
-        }
+        // Append path (adding attributes not already on the item) needs the
+        // real fn. In-place updates (overriding attributes already present
+        // on an already-painted weapon) work without it. Only flip to
+        // Degraded when neither will have any effect — not here.
 
         auto* controller = LocalController();     if (!controller) return false;
         auto* pawn       = LocalPawn(controller); if (!pawn)       return false;

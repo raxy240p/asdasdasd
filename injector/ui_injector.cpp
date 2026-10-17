@@ -5,6 +5,9 @@
 #include "target_find.hpp"
 #include "manual_map.hpp"
 #include "randomize.hpp"
+#ifdef SK_MODULE_STOMP
+#include "module_stomp.hpp"
+#endif
 
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
@@ -230,7 +233,12 @@ int Run(HINSTANCE hInst) {
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (now - lastPoll > std::chrono::milliseconds(500)) {
+        // AC scans are toolhelp snapshots — EDR-loud. Fast cadence only
+        // while blocked; stretch to ~3s once we're just waiting for CS2.
+        const auto acPeriod = (S.stage == Stage::AcBlocked)
+                                ? std::chrono::milliseconds(500)
+                                : std::chrono::milliseconds(3000);
+        if (now - lastPoll > acPeriod) {
             lastPoll = now;
             if (S.stage == Stage::AcBlocked || S.stage == Stage::WaitingCS2) {
                 S.ac = ac::ScanProcesses(/*checkSteam*/ !S.steamCheckedOnce);
@@ -238,10 +246,8 @@ int Run(HINSTANCE hInst) {
                     S.ac.erase(std::remove_if(S.ac.begin(), S.ac.end(),
                         [](const ac::Status& s){ return s.family == ac::Family::Steam; }),
                         S.ac.end());
-                } else {
-                    // Still watching for Steam; mark the gate satisfied only
-                    // once Steam is actually clear.
-                    if (ac::AllClear(S.ac)) S.steamCheckedOnce = true;
+                } else if (ac::AllClear(S.ac)) {
+                    S.steamCheckedOnce = true;
                 }
                 if (!ac::AllClear(S.ac)) S.stage = Stage::AcBlocked;
                 else if (S.stage == Stage::AcBlocked) S.stage = Stage::WaitingCS2;
@@ -316,10 +322,17 @@ int Run(HINSTANCE hInst) {
                 S.stage = Stage::Fail; S.failMsg = "cheat.dll missing next to loader";
                 LogLine(S.failMsg.c_str());
             } else {
+#ifdef SK_MODULE_STOMP
+                LogLine("stomp mapping...");
+                injector::stomp::Options opts;
+                opts.readyFlagRva = 0;
+                auto r = injector::stomp::InjectStomp(S.cs2->pid, bytes, opts, &LogLine);
+#else
                 LogLine("manual mapping...");
                 mapper::Options opts;
                 opts.readyFlagRva = 0;
                 auto r = mapper::Inject(S.cs2->pid, bytes, opts, &LogLine);
+#endif
                 if (r.ok) {
                     LogLine("injected ok");
                     // Grab a SYNCHRONIZE handle to watch for cs2 exit. If it
