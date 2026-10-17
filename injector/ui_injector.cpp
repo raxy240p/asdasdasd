@@ -108,7 +108,8 @@ std::filesystem::path DefaultDllPath() {
     return p.parent_path() / L"cheat.dll";
 }
 
-enum class Stage { Scanning, AcBlocked, WaitingCS2, Injecting, Done, Fail };
+enum class Stage { Scanning, AcBlocked, WaitingCS2, Injecting,
+                   Watching, GameClosed, Fail };
 
 struct State {
     Stage                    stage = Stage::Scanning;
@@ -116,6 +117,10 @@ struct State {
     std::vector<ac::Status>  ac;
     std::optional<target::CS2Window> cs2;
     std::string              failMsg;
+
+    // Self-destruct state (post-inject).
+    HANDLE                   watchHandle = nullptr;         // cs2 process, SYNCHRONIZE
+    std::filesystem::path    cheatDllPath;                  // deleted on cs2 exit
 };
 
 const char* StageText(Stage s) {
@@ -124,10 +129,45 @@ const char* StageText(Stage s) {
         case Stage::AcBlocked:   return "BLOCKED";
         case Stage::WaitingCS2:  return "WAITING";
         case Stage::Injecting:   return "WORKING";
-        case Stage::Done:        return "INJECTED";
+        case Stage::Watching:    return "WATCHING";
+        case Stage::GameClosed:  return "CLEANED";
         case Stage::Fail:        return "FAILED";
     }
     return "?";
+}
+
+// Delete the file at `p`. If a direct delete fails (lock), retry briefly.
+bool DeleteWithRetry(const std::filesystem::path& p) {
+    for (int i = 0; i < 20; ++i) {
+        if (DeleteFileW(p.c_str())) return true;
+        Sleep(50);
+    }
+    return false;
+}
+
+// POSIX-delete the running staged exe. Opens the exe with DELETE share, flags
+// it for POSIX-semantics delete, and lets ExitProcess finish the job. Falls
+// back to MoveFileEx(DELAY_UNTIL_REBOOT) when the volume isn't NTFS or the
+// SDK is too old to know the flag.
+void SelfDestructOnExit() {
+    wchar_t self[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return;
+
+    HANDLE h = CreateFileW(self, DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        FILE_DISPOSITION_INFO_EX info{};
+        info.Flags = 0x1 /* DELETE */ | 0x2 /* POSIX_SEMANTICS */;
+        if (SetFileInformationByHandle(h, FileDispositionInfoEx,
+                                       &info, sizeof(info))) {
+            CloseHandle(h);
+            return; // deletes on process exit
+        }
+        CloseHandle(h);
+    }
+    // Fallback: reboot-time delete. Not immediate but guaranteed.
+    MoveFileExW(self, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
 }
 
 } // namespace
@@ -172,6 +212,22 @@ int Run(HINSTANCE hInst) {
             if (msg.message == WM_QUIT) quit = true;
         }
         if (quit) break;
+
+        // Watch for CS2 exit (non-blocking). Fires once, then cleans up and
+        // schedules our own exit on the next frame.
+        if (S.stage == Stage::Watching && S.watchHandle) {
+            if (WaitForSingleObject(S.watchHandle, 0) == WAIT_OBJECT_0) {
+                LogLine("cs2 exited — deleting cheat.dll");
+                DeleteWithRetry(S.cheatDllPath);
+                SelfDestructOnExit();
+                CloseHandle(S.watchHandle);
+                S.watchHandle = nullptr;
+                S.stage = Stage::GameClosed;
+            }
+        } else if (S.stage == Stage::GameClosed) {
+            // One frame of "Cleaning up..." visible, then out.
+            quit = true;
+        }
 
         const auto now = std::chrono::steady_clock::now();
         if (now - lastPoll > std::chrono::milliseconds(500)) {
@@ -234,21 +290,28 @@ int Run(HINSTANCE hInst) {
         if (!canInject) ImGui::BeginDisabled();
         if (ImGui::Button("INJECT", {160, 28})) {
             S.stage = Stage::Injecting;
+            S.cheatDllPath = DefaultDllPath();
             LogLine("reading cheat.dll...");
-            auto bytes = ReadFileBytes(DefaultDllPath());
+            auto bytes = ReadFileBytes(S.cheatDllPath);
             if (bytes.empty()) {
                 S.stage = Stage::Fail; S.failMsg = "cheat.dll missing next to loader";
                 LogLine(S.failMsg.c_str());
             } else {
                 LogLine("manual mapping...");
                 mapper::Options opts;
-                // ipc::Block RVA is export-resolved post-build; 0 = skip wait.
                 opts.readyFlagRva = 0;
                 auto r = mapper::Inject(S.cs2->pid, bytes, opts, &LogLine);
-                if (r.ok) { S.stage = Stage::Done; LogLine("injected ok"); }
-                else      { S.stage = Stage::Fail; S.failMsg = r.stage + ": " + r.message;
-                            LogLine(S.failMsg.c_str()); }
-                // zero local DLL buffer per §6.6
+                if (r.ok) {
+                    LogLine("injected ok");
+                    // Grab a SYNCHRONIZE handle to watch for cs2 exit. If it
+                    // fails we still succeed the inject — just no auto-clean.
+                    S.watchHandle = OpenProcess(SYNCHRONIZE, FALSE, S.cs2->pid);
+                    S.stage = S.watchHandle ? Stage::Watching : Stage::Fail;
+                    if (!S.watchHandle) { S.failMsg = "no SYNCHRONIZE on cs2 (can't auto-clean)"; }
+                } else {
+                    S.stage = Stage::Fail; S.failMsg = r.stage + ": " + r.message;
+                    LogLine(S.failMsg.c_str());
+                }
                 std::fill(bytes.begin(), bytes.end(), 0);
             }
         }
@@ -256,8 +319,12 @@ int Run(HINSTANCE hInst) {
         ImGui::SameLine();
         ImGui::Text("[%s]", StageText(S.stage));
 
-        if (S.stage == Stage::Done)
-            ImGui::TextColored({0.3f,1,0.5f,1}, "Injected — you may close this.");
+        if (S.stage == Stage::Watching)
+            ImGui::TextColored({0.3f,1,0.5f,1},
+                "Injected. Loader will self-destruct when CS2 closes.");
+        if (S.stage == Stage::GameClosed)
+            ImGui::TextColored({0.3f,1,0.5f,1},
+                "CS2 closed. Cleaning up and exiting...");
         if (S.stage == Stage::Fail)
             ImGui::TextColored({1,0.4f,0.4f,1}, "Fail: %s", S.failMsg.c_str());
 
@@ -278,6 +345,7 @@ int Run(HINSTANCE hInst) {
         g_dx.sc->Present(1, 0);
     }
 
+    if (S.watchHandle) { CloseHandle(S.watchHandle); S.watchHandle = nullptr; }
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

@@ -93,32 +93,6 @@ void ApplyCleanStyle() {
     co[ImGuiCol_TableBorderLight]   = border;
 }
 
-// Custom close X in the top-right of the window. Returns true if clicked.
-// Preserves the layout cursor so the caller can keep stacking widgets after.
-bool DrawCloseX() {
-    const float r = 10.0f;
-    const ImVec2 wp = ImGui::GetWindowPos();
-    const ImVec2 ws = ImGui::GetWindowSize();
-    const ImVec2 center = { wp.x + ws.x - r - 10.0f, wp.y + r + 8.0f };
-    auto* dl = ImGui::GetWindowDrawList();
-
-    const ImVec2 saveCursor = ImGui::GetCursorScreenPos();
-    ImGui::SetCursorScreenPos({ center.x - r, center.y - r });
-    ImGui::InvisibleButton("##closeX", { r * 2, r * 2 });
-    const bool hovered = ImGui::IsItemHovered();
-    const bool clicked = ImGui::IsItemClicked();
-    ImGui::SetCursorScreenPos(saveCursor);
-
-    const ImU32 col = hovered ? IM_COL32(240, 90, 90, 255)
-                              : IM_COL32(170, 70, 70, 220);
-    dl->AddCircleFilled(center, r, col);
-    const float d = r * 0.5f;
-    const ImU32 glyph = IM_COL32(240, 240, 240, 255);
-    dl->AddLine({ center.x - d, center.y - d }, { center.x + d, center.y + d }, glyph, 1.6f);
-    dl->AddLine({ center.x - d, center.y + d }, { center.x + d, center.y - d }, glyph, 1.6f);
-    return clicked;
-}
-
 } // namespace
 
 void Init(const std::filesystem::path& configDir) {
@@ -174,11 +148,11 @@ void Tick() {
         ImGuiWindowFlags_NoScrollWithMouse;
 
     if (ImGui::Begin("##cheat_main", nullptr, flags)) {
-        // Custom top bar: title left, X right.
+        // Top strip: title only. INSERT toggles the menu — no in-window X,
+        // the only close chrome belongs to the loader (native Win32).
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.92f, 0.94f, 1.0f));
-        ImGui::Text("skinloader");
+        ImGui::Text("skinloader   [INSERT to close]");
         ImGui::PopStyleColor();
-        if (DrawCloseX()) g_open = false;
 
         ImGui::Spacing();
         ImGui::Separator();
