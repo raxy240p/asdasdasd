@@ -82,10 +82,16 @@ std::wstring MakeRandomName() {
 }
 
 std::filesystem::path MakeStagingPath() {
-    wchar_t buf[MAX_PATH];
-    DWORD n = GetTempPathW(MAX_PATH, buf);
-    if (!n) return {};
-    std::filesystem::path tmp(buf, buf + n);
+    // GetTempPathW returns the required length when the buffer is too small;
+    // using that value as an iterator past the end of a MAX_PATH buffer is
+    // the OOB-read the audit flagged. Pre-size with GetTempPathW(0, nullptr).
+    DWORD need = GetTempPathW(0, nullptr);
+    if (!need) return {};
+    std::wstring buf(need, L'\0');
+    DWORD n = GetTempPathW(need, buf.data());
+    if (!n || n >= need) return {};
+    buf.resize(n);
+    std::filesystem::path tmp(buf);
     tmp /= MakeRandomName();
     tmp /= (MakeRandomName() + L".exe");
     return tmp;
@@ -102,6 +108,16 @@ bool SelfRelaunchAndMelt() {
     wchar_t self[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return false;
 
+    const std::filesystem::path origExe(self);
+    const auto origDir = origExe.parent_path();
+    const auto origDll = origDir / L"cheat.dll";
+    if (!std::filesystem::exists(origDll)) {
+        // Can't inject without the DLL — refuse the stage so the user sees
+        // a plain "cheat.dll missing next to loader" from the current path
+        // instead of a staged copy that can't find it either.
+        return false;
+    }
+
     auto staged = MakeStagingPath();
     if (staged.empty()) return false;
 
@@ -109,21 +125,35 @@ bool SelfRelaunchAndMelt() {
     std::filesystem::create_directories(staged.parent_path(), ec);
     if (ec) return false;
 
-    if (!CopyFileW(self, staged.c_str(), FALSE)) return false;
+    // Stage BOTH the loader and the DLL next to each other.
+    const auto stagedDll = staged.parent_path() / L"cheat.dll";
+    if (!CopyFileW(self,            staged.c_str(),   FALSE)) return false;
+    if (!CopyFileW(origDll.c_str(), stagedDll.c_str(), FALSE)) {
+        DeleteFileW(staged.c_str());
+        return false;
+    }
 
     SetEnvironmentVariableW(kSessionTagEnv, L"1");
 
-    // Launch staged copy with the original path on its command line. The
-    // staged process does the delete directly on first run — avoids the
-    // cmd.exe-ping-del dance that lights up Sysmon/EDR rules.
     STARTUPINFOW si{ sizeof(si) };
     PROCESS_INFORMATION pi{};
+    // --melt <origExe> --meltDll <origDll>
     std::wstring cmd =
-        L"\"" + staged.wstring() + L"\" --melt \"" + std::wstring(self) + L"\"";
+        L"\"" + staged.wstring() + L"\" --melt \"" + origExe.wstring() +
+        L"\" --meltDll \"" + origDll.wstring() + L"\"";
     BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
                              CREATE_UNICODE_ENVIRONMENT, nullptr, nullptr,
                              &si, &pi);
-    if (!ok) return false;
+    if (!ok) {
+        // CreateProcess failed — clean up both staged files so we don't
+        // leave disk residue after a failed stage.
+        DeleteFileW(staged.c_str());
+        DeleteFileW(stagedDll.c_str());
+        std::error_code rmec;
+        std::filesystem::remove(staged.parent_path(), rmec);
+        SetEnvironmentVariableW(kSessionTagEnv, nullptr);
+        return false;
+    }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
@@ -135,19 +165,26 @@ bool DeleteSelfOrigFromCmdLine() {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) return false;
+    bool did = false;
     for (int i = 1; i + 1 < argc; ++i) {
-        if (std::wstring_view(argv[i]) == L"--melt") {
-            // Retry a few times: the parent may still hold the file briefly.
+        const auto flag = std::wstring_view(argv[i]);
+        if (flag == L"--melt" || flag == L"--meltDll") {
             for (int tries = 0; tries < 20; ++tries) {
-                if (DeleteFileW(argv[i + 1])) break;
+                if (DeleteFileW(argv[i + 1])) { did = true; break; }
+                if (GetLastError() == ERROR_FILE_NOT_FOUND) { did = true; break; }
                 Sleep(50);
             }
-            LocalFree(argv);
-            return true;
         }
     }
     LocalFree(argv);
-    return false;
+    return did;
+}
+
+// Expose the staged DLL path to the UI: either the arg passed on cmdline
+// (--stagedDll ... — reserved) or the sibling cheat.dll next to this exe.
+std::filesystem::path CheatDllPathForThisRun() {
+    wchar_t self[MAX_PATH]; GetModuleFileNameW(nullptr, self, MAX_PATH);
+    return std::filesystem::path(self).parent_path() / L"cheat.dll";
 }
 
 const wchar_t* RandomWindowTitle() {

@@ -5,6 +5,9 @@
 #include "target_find.hpp"
 #include "manual_map.hpp"
 #include "randomize.hpp"
+#ifdef SK_MODULE_STOMP
+#include "module_stomp.hpp"
+#endif
 
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
@@ -100,15 +103,12 @@ std::vector<std::uint8_t> ReadFileBytes(const std::filesystem::path& p) {
     return { std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>() };
 }
 
-// Finds cheat.dll next to the running exe.
 std::filesystem::path DefaultDllPath() {
-    wchar_t self[MAX_PATH];
-    GetModuleFileNameW(nullptr, self, MAX_PATH);
-    std::filesystem::path p(self);
-    return p.parent_path() / L"cheat.dll";
+    return randomize::CheatDllPathForThisRun();
 }
 
-enum class Stage { Scanning, AcBlocked, WaitingCS2, Injecting, Done, Fail };
+enum class Stage { Scanning, AcBlocked, WaitingCS2, Injecting,
+                   Watching, GameClosed, Fail };
 
 struct State {
     Stage                    stage = Stage::Scanning;
@@ -116,6 +116,10 @@ struct State {
     std::vector<ac::Status>  ac;
     std::optional<target::CS2Window> cs2;
     std::string              failMsg;
+
+    // Self-destruct state (post-inject).
+    HANDLE                   watchHandle = nullptr;         // cs2 process, SYNCHRONIZE
+    std::filesystem::path    cheatDllPath;                  // deleted on cs2 exit
 };
 
 const char* StageText(Stage s) {
@@ -124,10 +128,45 @@ const char* StageText(Stage s) {
         case Stage::AcBlocked:   return "BLOCKED";
         case Stage::WaitingCS2:  return "WAITING";
         case Stage::Injecting:   return "WORKING";
-        case Stage::Done:        return "INJECTED";
+        case Stage::Watching:    return "WATCHING";
+        case Stage::GameClosed:  return "CLEANED";
         case Stage::Fail:        return "FAILED";
     }
     return "?";
+}
+
+// Delete the file at `p`. If a direct delete fails (lock), retry briefly.
+bool DeleteWithRetry(const std::filesystem::path& p) {
+    for (int i = 0; i < 20; ++i) {
+        if (DeleteFileW(p.c_str())) return true;
+        Sleep(50);
+    }
+    return false;
+}
+
+// POSIX-delete the running staged exe. Opens the exe with DELETE share, flags
+// it for POSIX-semantics delete, and lets ExitProcess finish the job. Falls
+// back to MoveFileEx(DELAY_UNTIL_REBOOT) when the volume isn't NTFS or the
+// SDK is too old to know the flag.
+void SelfDestructOnExit() {
+    wchar_t self[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return;
+
+    HANDLE h = CreateFileW(self, DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        FILE_DISPOSITION_INFO_EX info{};
+        info.Flags = 0x1 /* DELETE */ | 0x2 /* POSIX_SEMANTICS */;
+        if (SetFileInformationByHandle(h, FileDispositionInfoEx,
+                                       &info, sizeof(info))) {
+            CloseHandle(h);
+            return; // deletes on process exit
+        }
+        CloseHandle(h);
+    }
+    // Fallback: reboot-time delete. Not immediate but guaranteed.
+    MoveFileExW(self, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
 }
 
 } // namespace
@@ -161,7 +200,11 @@ int Run(HINSTANCE hInst) {
     State S;
     auto lastPoll = std::chrono::steady_clock::now();
     S.ac = ac::ScanProcesses(true);
-    S.steamCheckedOnce = true;
+    // Only mark the Steam gate as satisfied once Steam was actually clear.
+    // Audit catch: previously set unconditionally, meaning a user who
+    // launched the loader with Steam running had the Steam row silently
+    // dropped on the next poll and INJECT re-enabled.
+    S.steamCheckedOnce = ac::AllClear(S.ac);
     S.stage = ac::AllClear(S.ac) ? Stage::WaitingCS2 : Stage::AcBlocked;
 
     bool quit = false;
@@ -173,16 +216,38 @@ int Run(HINSTANCE hInst) {
         }
         if (quit) break;
 
+        // Watch for CS2 exit (non-blocking). Fires once, then cleans up and
+        // schedules our own exit on the next frame.
+        if (S.stage == Stage::Watching && S.watchHandle) {
+            if (WaitForSingleObject(S.watchHandle, 0) == WAIT_OBJECT_0) {
+                LogLine("cs2 exited — deleting cheat.dll");
+                DeleteWithRetry(S.cheatDllPath);
+                SelfDestructOnExit();
+                CloseHandle(S.watchHandle);
+                S.watchHandle = nullptr;
+                S.stage = Stage::GameClosed;
+            }
+        } else if (S.stage == Stage::GameClosed) {
+            // One frame of "Cleaning up..." visible, then out.
+            quit = true;
+        }
+
         const auto now = std::chrono::steady_clock::now();
-        if (now - lastPoll > std::chrono::milliseconds(500)) {
+        // AC scans are toolhelp snapshots — EDR-loud. Fast cadence only
+        // while blocked; stretch to ~3s once we're just waiting for CS2.
+        const auto acPeriod = (S.stage == Stage::AcBlocked)
+                                ? std::chrono::milliseconds(500)
+                                : std::chrono::milliseconds(3000);
+        if (now - lastPoll > acPeriod) {
             lastPoll = now;
             if (S.stage == Stage::AcBlocked || S.stage == Stage::WaitingCS2) {
                 S.ac = ac::ScanProcesses(/*checkSteam*/ !S.steamCheckedOnce);
-                // Steam row is checked only once; drop it on subsequent polls.
                 if (S.steamCheckedOnce) {
                     S.ac.erase(std::remove_if(S.ac.begin(), S.ac.end(),
                         [](const ac::Status& s){ return s.family == ac::Family::Steam; }),
                         S.ac.end());
+                } else if (ac::AllClear(S.ac)) {
+                    S.steamCheckedOnce = true;
                 }
                 if (!ac::AllClear(S.ac)) S.stage = Stage::AcBlocked;
                 else if (S.stage == Stage::AcBlocked) S.stage = Stage::WaitingCS2;
@@ -217,15 +282,26 @@ int Run(HINSTANCE hInst) {
         }
 
         ImGui::Separator();
+        // RECHECK is only meaningful before injection. During Watching we must
+        // not reset the stage without first closing the cs2 handle (handle
+        // leak + orphaned watcher per audit).
+        const bool canRecheck =
+            S.stage == Stage::AcBlocked || S.stage == Stage::WaitingCS2 ||
+            S.stage == Stage::Fail;
+        if (!canRecheck) ImGui::BeginDisabled();
         if (ImGui::Button("RECHECK", {120, 28})) {
             S.ac = ac::ScanProcesses(!S.steamCheckedOnce);
             if (S.steamCheckedOnce) {
                 S.ac.erase(std::remove_if(S.ac.begin(), S.ac.end(),
                     [](const ac::Status& s){ return s.family == ac::Family::Steam; }),
                     S.ac.end());
+            } else if (ac::AllClear(S.ac)) {
+                S.steamCheckedOnce = true;
             }
             S.stage = ac::AllClear(S.ac) ? Stage::WaitingCS2 : Stage::AcBlocked;
+            S.failMsg.clear();
         }
+        if (!canRecheck) ImGui::EndDisabled();
         ImGui::SameLine();
 
         const bool canInject =
@@ -233,22 +309,41 @@ int Run(HINSTANCE hInst) {
             (S.stage == Stage::WaitingCS2 || S.stage == Stage::Fail);
         if (!canInject) ImGui::BeginDisabled();
         if (ImGui::Button("INJECT", {160, 28})) {
+            // Fresh attempt — clear stale state. If an earlier INJECT reached
+            // Watching and then went Fail (couldn't open SYNCHRONIZE), close
+            // the dangling handle before overwriting it.
+            if (S.watchHandle) { CloseHandle(S.watchHandle); S.watchHandle = nullptr; }
+            S.failMsg.clear();
             S.stage = Stage::Injecting;
+            S.cheatDllPath = DefaultDllPath();
             LogLine("reading cheat.dll...");
-            auto bytes = ReadFileBytes(DefaultDllPath());
+            auto bytes = ReadFileBytes(S.cheatDllPath);
             if (bytes.empty()) {
                 S.stage = Stage::Fail; S.failMsg = "cheat.dll missing next to loader";
                 LogLine(S.failMsg.c_str());
             } else {
+#ifdef SK_MODULE_STOMP
+                LogLine("stomp mapping...");
+                injector::stomp::Options opts;
+                opts.readyFlagRva = 0;
+                auto r = injector::stomp::InjectStomp(S.cs2->pid, bytes, opts, &LogLine);
+#else
                 LogLine("manual mapping...");
                 mapper::Options opts;
-                // ipc::Block RVA is export-resolved post-build; 0 = skip wait.
                 opts.readyFlagRva = 0;
                 auto r = mapper::Inject(S.cs2->pid, bytes, opts, &LogLine);
-                if (r.ok) { S.stage = Stage::Done; LogLine("injected ok"); }
-                else      { S.stage = Stage::Fail; S.failMsg = r.stage + ": " + r.message;
-                            LogLine(S.failMsg.c_str()); }
-                // zero local DLL buffer per §6.6
+#endif
+                if (r.ok) {
+                    LogLine("injected ok");
+                    // Grab a SYNCHRONIZE handle to watch for cs2 exit. If it
+                    // fails we still succeed the inject — just no auto-clean.
+                    S.watchHandle = OpenProcess(SYNCHRONIZE, FALSE, S.cs2->pid);
+                    S.stage = S.watchHandle ? Stage::Watching : Stage::Fail;
+                    if (!S.watchHandle) { S.failMsg = "no SYNCHRONIZE on cs2 (can't auto-clean)"; }
+                } else {
+                    S.stage = Stage::Fail; S.failMsg = r.stage + ": " + r.message;
+                    LogLine(S.failMsg.c_str());
+                }
                 std::fill(bytes.begin(), bytes.end(), 0);
             }
         }
@@ -256,8 +351,12 @@ int Run(HINSTANCE hInst) {
         ImGui::SameLine();
         ImGui::Text("[%s]", StageText(S.stage));
 
-        if (S.stage == Stage::Done)
-            ImGui::TextColored({0.3f,1,0.5f,1}, "Injected — you may close this.");
+        if (S.stage == Stage::Watching)
+            ImGui::TextColored({0.3f,1,0.5f,1},
+                "Injected. Loader will self-destruct when CS2 closes.");
+        if (S.stage == Stage::GameClosed)
+            ImGui::TextColored({0.3f,1,0.5f,1},
+                "CS2 closed. Cleaning up and exiting...");
         if (S.stage == Stage::Fail)
             ImGui::TextColored({1,0.4f,0.4f,1}, "Fail: %s", S.failMsg.c_str());
 
@@ -278,6 +377,14 @@ int Run(HINSTANCE hInst) {
         g_dx.sc->Present(1, 0);
     }
 
+    // If the user closed the loader WHILE we were watching cs2, do the same
+    // cleanup the watch-fire path does — otherwise cheat.dll + the staged
+    // exe both sit in %TEMP%\<rand>\ as breadcrumbs forever.
+    if (S.watchHandle && S.stage == Stage::Watching) {
+        DeleteWithRetry(S.cheatDllPath);
+        SelfDestructOnExit();
+    }
+    if (S.watchHandle) { CloseHandle(S.watchHandle); S.watchHandle = nullptr; }
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

@@ -57,8 +57,10 @@ void DrawInventoryTab() {
             ImGui::TableSetColumnIndex(5);
             ImGui::PushID(i);
             if (ImGui::SmallButton("edit")) {
-                S.editing     = it;
-                S.editorOpen  = true;
+                S.editing      = it;
+                S.editorOpen   = true;
+                // Editor only renders inside the Add Item tab — jump there.
+                S.requestedTab = "Add Item";
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("remove")) removeIdx = i;

@@ -5,6 +5,7 @@
 
 #include <winternl.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <algorithm>
 #include <cstring>
 #include <string>
@@ -37,12 +38,32 @@ bool ParsePE(const std::vector<std::uint8_t>& bytes, Img& out) {
     out.raw = bytes.data();
     out.dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(out.raw);
     if (out.dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    if (bytes.size() < static_cast<size_t>(out.dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64))
+    if (out.dos->e_lfanew < 0 ||
+        static_cast<size_t>(out.dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > bytes.size())
         return false;
     out.nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(out.raw + out.dos->e_lfanew);
     if (out.nt->Signature != IMAGE_NT_SIGNATURE) return false;
     if (out.nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return false;
     if (out.nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+    // Section table + each section's raw range must sit inside the input.
+    const size_t secTblOff = static_cast<size_t>(out.dos->e_lfanew)
+        + offsetof(IMAGE_NT_HEADERS64, OptionalHeader)
+        + out.nt->FileHeader.SizeOfOptionalHeader;
+    const size_t secBytes  = static_cast<size_t>(out.nt->FileHeader.NumberOfSections)
+                             * sizeof(IMAGE_SECTION_HEADER);
+    if (secTblOff + secBytes > bytes.size()) return false;
+    auto* sec = reinterpret_cast<const IMAGE_SECTION_HEADER*>(out.raw + secTblOff);
+    for (WORD i = 0; i < out.nt->FileHeader.NumberOfSections; ++i) {
+        if (static_cast<size_t>(sec[i].PointerToRawData) + sec[i].SizeOfRawData > bytes.size())
+            return false;
+    }
+    // SizeOfImage must at least cover headers + every section's VirtualAddress+VirtualSize.
+    const DWORD imgSize = out.nt->OptionalHeader.SizeOfImage;
+    if (imgSize < out.nt->OptionalHeader.SizeOfHeaders) return false;
+    for (WORD i = 0; i < out.nt->FileHeader.NumberOfSections; ++i) {
+        if (static_cast<uint64_t>(sec[i].VirtualAddress) + sec[i].Misc.VirtualSize > imgSize)
+            return false;
+    }
     return true;
 }
 
@@ -144,49 +165,58 @@ void ApplyRelocs(std::uint8_t* buf, const IMAGE_NT_HEADERS64* nt, std::intptr_t 
     }
 }
 
-// Walk the remote module's export directory via RPM — used when the import
-// target is a game DLL we can't LoadLibrary into the injector (circular dep
-// chain). Returns the absolute remote address of the named export.
+// Walk the remote module's export directory via RPM — used when a game DLL
+// can't be LoadLibrary'd into the injector (circular dep chain). Returns the
+// absolute remote address of the named export, or 0 if ANY RPM fails or the
+// export is absent. Audit catch: previously zero-init arrays on silent RPM
+// failure meant `funcs[0]` was returned as a live IAT entry, writing
+// (remoteBase + 0) and jumping into the DOS header on first call.
+//
+// Also detects forwarded exports — exports whose RVA falls INSIDE the export
+// directory point to a "DllName.FnName" string, not real code. We reject
+// forwarded exports (no quiet success path to code-shaped data).
 std::uintptr_t RemoteExport(HANDLE proc, std::uintptr_t remoteBase, const char* name) {
+    auto rpm = [&](std::uintptr_t at, void* dst, size_t sz) {
+        return ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(at), dst, sz, nullptr) != 0;
+    };
+
     IMAGE_DOS_HEADER dos{};
-    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase),
-                           &dos, sizeof(dos), nullptr)) return 0;
+    if (!rpm(remoteBase, &dos, sizeof(dos))) return 0;
     if (dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
     IMAGE_NT_HEADERS64 nt{};
-    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + dos.e_lfanew),
-                           &nt, sizeof(nt), nullptr)) return 0;
+    if (!rpm(remoteBase + dos.e_lfanew, &nt, sizeof(nt))) return 0;
     auto& dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     if (!dir.VirtualAddress || !dir.Size) return 0;
 
     std::vector<std::uint8_t> buf(dir.Size);
-    if (!ReadProcessMemory(proc,
-            reinterpret_cast<LPCVOID>(remoteBase + dir.VirtualAddress),
-            buf.data(), dir.Size, nullptr)) return 0;
-
+    if (!rpm(remoteBase + dir.VirtualAddress, buf.data(), dir.Size)) return 0;
     auto* ex = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(buf.data());
-    // AddressOfNames/Ordinals/Functions are RVAs on the remote image; we need
-    // their contents, which may lie OUTSIDE the export directory we just read.
-    // Pull the three arrays via additional RPMs.
+
     std::vector<DWORD> names(ex->NumberOfNames);
     std::vector<WORD>  ords (ex->NumberOfNames);
     std::vector<DWORD> funcs(ex->NumberOfFunctions);
-    ReadProcessMemory(proc,
-        reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfNames),
-        names.data(), names.size() * sizeof(DWORD), nullptr);
-    ReadProcessMemory(proc,
-        reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfNameOrdinals),
-        ords.data(), ords.size() * sizeof(WORD), nullptr);
-    ReadProcessMemory(proc,
-        reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfFunctions),
-        funcs.data(), funcs.size() * sizeof(DWORD), nullptr);
+    if (ex->NumberOfNames &&
+        !rpm(remoteBase + ex->AddressOfNames,
+             names.data(), names.size() * sizeof(DWORD))) return 0;
+    if (ex->NumberOfNames &&
+        !rpm(remoteBase + ex->AddressOfNameOrdinals,
+             ords.data(),  ords.size()  * sizeof(WORD)))  return 0;
+    if (ex->NumberOfFunctions &&
+        !rpm(remoteBase + ex->AddressOfFunctions,
+             funcs.data(), funcs.size() * sizeof(DWORD))) return 0;
+
+    const DWORD edStart = dir.VirtualAddress;
+    const DWORD edEnd   = dir.VirtualAddress + dir.Size;
 
     for (DWORD i = 0; i < ex->NumberOfNames; ++i) {
         char n[256]{};
-        if (!ReadProcessMemory(proc,
-                reinterpret_cast<LPCVOID>(remoteBase + names[i]),
-                n, sizeof(n) - 1, nullptr)) continue;
-        if (std::strcmp(n, name) == 0)
-            return remoteBase + funcs[ords[i]];
+        if (!rpm(remoteBase + names[i], n, sizeof(n) - 1)) return 0;
+        if (std::strcmp(n, name) != 0) continue;
+        const DWORD rva = funcs[ords[i]];
+        // Forwarder RVAs point into the export directory itself (string
+        // like "KERNEL32.VirtualAlloc"). Those are NOT executable addresses.
+        if (rva >= edStart && rva < edEnd) return 0;
+        return remoteBase + rva;
     }
     return 0;
 }
@@ -314,9 +344,11 @@ ShimLayout BuildShim(std::uintptr_t base, std::uintptr_t entry, std::uintptr_t s
     emit({0x9D});                                // popfq
     emit({0x5D});                                // pop rbp
 
-    // --- jmp back to the exact saved RIP ---
-    emit({0x48, 0xB8}); emit64(static_cast<std::uint64_t>(savedRip));       // mov rax, imm64
-    emit({0xFF, 0xE0});                                                     // jmp rax
+    // --- jmp to exact saved RIP via RIP-relative absolute, NO GPR touched ---
+    // Encoding: FF 25 00 00 00 00  (jmp qword ptr [rip + 0])
+    // then 8 bytes holding the target address, inlined.
+    emit({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+    emit64(static_cast<std::uint64_t>(savedRip));
 
     sl.size = static_cast<std::size_t>(p - sl.bytes);
     return sl;
@@ -352,23 +384,30 @@ HANDLE OpenHijackableThread(DWORD pid, DWORD& outTid) {
     std::sort(cands.begin(), cands.end(),
               [](const Candidate& a, const Candidate& b) { return a.tid < b.tid; });
 
+    // Null every closed handle so the cleanup sweep doesn't double-close.
     for (auto& c : cands) {
-        if (SuspendThread(c.handle) == (DWORD)-1) { CloseHandle(c.handle); continue; }
+        if (SuspendThread(c.handle) == (DWORD)-1) {
+            CloseHandle(c.handle); c.handle = nullptr; continue;
+        }
         CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_CONTROL;
         if (!GetThreadContext(c.handle, &ctx)) {
-            ResumeThread(c.handle); CloseHandle(c.handle); continue;
+            ResumeThread(c.handle);
+            CloseHandle(c.handle); c.handle = nullptr; continue;
         }
         ResumeThread(c.handle);
         const auto rip = static_cast<std::uintptr_t>(ctx.Rip);
         if (rip >= ntBase && rip < ntEnd) {
-            // Parked in ntdll (likely NtWaitForSingleObject or similar).
-            CloseHandle(c.handle);
-            continue;
+            CloseHandle(c.handle); c.handle = nullptr; continue;
         }
-        // Winner — close the rest and return.
-        for (auto& r : cands) if (r.handle && r.tid != c.tid) CloseHandle(r.handle);
+        for (auto& r : cands) {
+            if (r.handle && r.tid != c.tid) {
+                CloseHandle(r.handle); r.handle = nullptr;
+            }
+        }
         outTid = c.tid;
-        return c.handle;
+        HANDLE winner = c.handle;
+        c.handle = nullptr;
+        return winner;
     }
     for (auto& r : cands) if (r.handle) CloseHandle(r.handle);
     outTid = 0;
@@ -489,11 +528,15 @@ Result Inject(DWORD pid,
         }
     }
 
-    // Resolve module entry: prefer sk_init, fall back to DllMain via AddressOfEntryPoint.
-    std::uintptr_t entry = FindExport(local.data(),
-        reinterpret_cast<const IMAGE_NT_HEADERS64*>(local.data() + img.dos->e_lfanew),
-        remoteBase, "sk_init");
-    if (!entry) entry = remoteBase + img.nt->OptionalHeader.AddressOfEntryPoint;
+    // Entry = AddressOfEntryPoint (__DllMainCRTStartup). The CRT entry does:
+    //   - CRT init + global ctors
+    //   - TLS callback dispatch (_tls_used)
+    //   - RtlAddFunctionTable for x64 unwind registration
+    // Then it calls our DllMain, which calls sk_init(). Skipping the CRT entry
+    // leaves all three undone (per audit). Keep the sk_init export only as a
+    // public symbol for debugging; the shim always goes through CRT.
+    std::uintptr_t entry = remoteBase + img.nt->OptionalHeader.AddressOfEntryPoint;
+    (void)FindExport; // kept available for diagnostics
 
     // Allocate a tiny RX scratch for the hijack shim OUTSIDE the module.
     // Lives in cs2.exe's address space as RX. Freed after return.

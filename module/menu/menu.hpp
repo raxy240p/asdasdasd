@@ -1,10 +1,12 @@
 #pragma once
+#include <windows.h>  // VK_INSERT for toggleVk default
 #include "../items/item_config.hpp"
 #include "../items/item_db.hpp"
 #include "../items/preview.hpp"
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace cheat::menu {
@@ -27,6 +29,9 @@ struct State {
     // Settings
     int         toggleVk = VK_INSERT;  // §4.2 Settings — rebindable
     bool        showOffsetsStatus = false;
+
+    // Tab the UI should jump to on next frame (e.g. Inventory edit → Add Item).
+    std::string requestedTab;
 
     std::filesystem::path configDir;
 };

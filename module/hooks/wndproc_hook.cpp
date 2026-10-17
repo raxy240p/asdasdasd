@@ -3,6 +3,7 @@
 #include "../render/dx11_setup.hpp"
 
 #include <imgui.h>
+#include <imgui_impl_win32.h>   // supplies ImGui_ImplWin32_WndProcHandler
 
 namespace cheat::hooks {
 
@@ -10,8 +11,6 @@ namespace {
 
 WNDPROC g_orig = nullptr;
 HWND    g_hwnd = nullptr;
-
-extern "C" LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 LRESULT CALLBACK Subclassed(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (cheat::render::IsBound()) {

@@ -27,12 +27,13 @@ repo/
 
 ```powershell
 # x64 only, MSVC. CMake pulls ImGui / nlohmann-json / stb automatically.
-cmake --preset=win64            # or: cmake -S . -B build -A x64
+cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-Artifacts land in `build\Release\loader.exe` and `build\Release\cheat.dll`.
-Put them next to each other and run `loader.exe`.
+Artifacts land in `build\injector\Release\loader.exe` and
+`build\module\Release\cheat.dll`. Put them next to each other and run
+`loader.exe`.
 
 ## Flow
 
@@ -72,6 +73,13 @@ python scripts/gen_items_db.py --skins skins.json --stickers stickers.json ...
 ```
 
 Writes `data/items.json` + a short SHA-256 next to it.
+
+## Graphics API
+
+CS2's render path hooks through DXGI/D3D11. Vulkan is NOT supported — if
+CS2 is launched with `-vulkan` the Present/ResizeBuffers detour never
+fires and the menu stays silent. Launch without `-vulkan` for the DX11
+path (CS2's default).
 
 ## Status
 

@@ -31,6 +31,19 @@ CAT_FROM_WEAPON_CATEGORY = {
 }
 
 
+def _as_int(v, default=0):
+    """Coerce upstream string ids to int; keep default on anything unparseable."""
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        try:
+            return int(str(v).strip() or default)
+        except (TypeError, ValueError):
+            return default
+
+
 def norm_rarity(r: str) -> str:
     r = (r or "").lower().replace(" ", "_")
     if "contraband" in r:        return "contraband"
@@ -47,21 +60,25 @@ def norm_rarity(r: str) -> str:
 def ingest_skins(path: Path, out: dict):
     data = json.loads(path.read_text(encoding="utf-8"))
     for row in data:
-        wname = row.get("weapon", {}).get("name") or row.get("weapon", {}).get("weapon_name")
+        weapon  = row.get("weapon") or {}
+        wname   = weapon.get("name") or weapon.get("weapon_name")
         if not wname: continue
-        cat_raw = (row.get("category", {}) or {}).get("name", "")
+        cat_raw = ((row.get("category") or {}).get("name") or "")
         cat_name = CAT_FROM_WEAPON_CATEGORY.get(cat_raw.lower(), "Rifles")
         buck = out["categories"].setdefault(cat_name, {})
         w    = buck.setdefault(wname, {
-            "def_index": row.get("weapon", {}).get("weapon_id", 0),
+            "def_index": _as_int(weapon.get("weapon_id")),
             "paints": [],
         })
+        # Knives have pattern: null — (v or {}).get() guards each hop.
+        pattern = row.get("pattern") or {}
+        rarity  = row.get("rarity") or {}
         w["paints"].append({
-            "name": row.get("pattern", {}).get("name", row.get("name", "?")),
-            "kit":  row.get("paint_index", 0),
-            "rarity": norm_rarity((row.get("rarity") or {}).get("name", "")),
-            "finish_quality_min": row.get("min_float", 0.0),
-            "max":                row.get("max_float", 1.0),
+            "name": pattern.get("name", row.get("name", "?")),
+            "kit":  _as_int(row.get("paint_index")),
+            "rarity": norm_rarity(rarity.get("name", "")),
+            "finish_quality_min": float(row.get("min_float") or 0.0),
+            "max":                float(row.get("max_float") or 1.0),
         })
 
 
@@ -69,9 +86,10 @@ def ingest_simple(path: Path, out_bucket: dict, id_key: str, def_key: str):
     for row in json.loads(path.read_text(encoding="utf-8")):
         name = row.get("name") or row.get("market_hash_name")
         if not name: continue
+        rarity = row.get("rarity") or {}
         out_bucket[name] = {
-            id_key: row.get(id_key) or row.get(def_key, 0),
-            "rarity": norm_rarity((row.get("rarity") or {}).get("name", "")),
+            id_key: _as_int(row.get(id_key) or row.get(def_key)),
+            "rarity": norm_rarity(rarity.get("name", "")),
         }
 
 
@@ -94,12 +112,24 @@ def main() -> int:
         if args.root: return args.root / default_name
         return None
 
-    if p := pick(args.skins,    "skins.json"):    ingest_skins(p, out)
-    if p := pick(args.stickers, "stickers.json"): ingest_simple(p, out["Stickers"], "sticker_id", "id")
-    if p := pick(args.charms,   "keychains.json"):ingest_simple(p, out["Charms"],   "charm_id",   "id")
-    if p := pick(args.agents,   "agents.json"):   ingest_simple(p, out["Agents"],   "def_index",  "def_index")
-    if p := pick(args.cases,    "crates.json"):   ingest_simple(p, out["Cases"],    "def_index",  "def_index")
-    if p := pick(args.keys,     "keys.json"):     ingest_simple(p, out["Keys"],     "def_index",  "def_index")
+    any_input = False
+    if p := pick(args.skins,    "skins.json"):
+        if p.exists(): ingest_skins(p, out);                           any_input = True
+    if p := pick(args.stickers, "stickers.json"):
+        if p.exists(): ingest_simple(p, out["Stickers"], "sticker_id", "id");    any_input = True
+    if p := pick(args.charms,   "keychains.json"):
+        if p.exists(): ingest_simple(p, out["Charms"],   "charm_id",   "id");    any_input = True
+    if p := pick(args.agents,   "agents.json"):
+        if p.exists(): ingest_simple(p, out["Agents"],   "def_index",  "def_index"); any_input = True
+    if p := pick(args.cases,    "crates.json"):
+        if p.exists(): ingest_simple(p, out["Cases"],    "def_index",  "def_index"); any_input = True
+    if p := pick(args.keys,     "keys.json"):
+        if p.exists(): ingest_simple(p, out["Keys"],     "def_index",  "def_index"); any_input = True
+
+    if not any_input:
+        print("error: no input files found; refusing to overwrite data/items.json",
+              file=sys.stderr)
+        return 2
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(out, indent=2, sort_keys=True)

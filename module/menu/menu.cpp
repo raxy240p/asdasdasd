@@ -3,6 +3,7 @@
 
 #include <imgui.h>
 #include <windows.h>
+#include <cstdlib>
 #include <fstream>
 
 namespace cheat::menu {
@@ -93,32 +94,6 @@ void ApplyCleanStyle() {
     co[ImGuiCol_TableBorderLight]   = border;
 }
 
-// Custom close X in the top-right of the window. Returns true if clicked.
-// Preserves the layout cursor so the caller can keep stacking widgets after.
-bool DrawCloseX() {
-    const float r = 10.0f;
-    const ImVec2 wp = ImGui::GetWindowPos();
-    const ImVec2 ws = ImGui::GetWindowSize();
-    const ImVec2 center = { wp.x + ws.x - r - 10.0f, wp.y + r + 8.0f };
-    auto* dl = ImGui::GetWindowDrawList();
-
-    const ImVec2 saveCursor = ImGui::GetCursorScreenPos();
-    ImGui::SetCursorScreenPos({ center.x - r, center.y - r });
-    ImGui::InvisibleButton("##closeX", { r * 2, r * 2 });
-    const bool hovered = ImGui::IsItemHovered();
-    const bool clicked = ImGui::IsItemClicked();
-    ImGui::SetCursorScreenPos(saveCursor);
-
-    const ImU32 col = hovered ? IM_COL32(240, 90, 90, 255)
-                              : IM_COL32(170, 70, 70, 220);
-    dl->AddCircleFilled(center, r, col);
-    const float d = r * 0.5f;
-    const ImU32 glyph = IM_COL32(240, 240, 240, 255);
-    dl->AddLine({ center.x - d, center.y - d }, { center.x + d, center.y + d }, glyph, 1.6f);
-    dl->AddLine({ center.x - d, center.y + d }, { center.x + d, center.y - d }, glyph, 1.6f);
-    return clicked;
-}
-
 } // namespace
 
 void Init(const std::filesystem::path& configDir) {
@@ -127,9 +102,17 @@ void Init(const std::filesystem::path& configDir) {
 
     auto dbPath = configDir / "items.json";
     if (!std::filesystem::exists(dbPath)) {
-        wchar_t self[MAX_PATH]; GetModuleFileNameW(nullptr, self, MAX_PATH);
-        auto fallback = std::filesystem::path(self).parent_path() / "data" / "items.json";
-        if (std::filesystem::exists(fallback)) dbPath = fallback;
+        // Prefer the injector-provided staged location, then fall back to the
+        // path beside cs2.exe.
+        if (const char* env = std::getenv("SK_ITEMS_DB")) {
+            std::filesystem::path staged{env};
+            if (std::filesystem::exists(staged)) dbPath = staged;
+        }
+        if (!std::filesystem::exists(dbPath)) {
+            wchar_t self[MAX_PATH]; GetModuleFileNameW(nullptr, self, MAX_PATH);
+            auto fallback = std::filesystem::path(self).parent_path() / "data" / "items.json";
+            if (std::filesystem::exists(fallback)) dbPath = fallback;
+        }
     }
     auto r = cheat::items::Load(dbPath);
     if (r.ok) g_s.db = std::move(r.db);
@@ -141,14 +124,30 @@ void Init(const std::filesystem::path& configDir) {
 
 void Shutdown() {
     SaveConfig();
-    g_s = {};
+    // State has an atomic<bool>, so copy-assign is deleted. Reset in place.
+    g_s.inventory.clear();
+    g_s.db = cheat::items::Db{};
+    g_s.dirty.store(false);
+    g_s.preview.reset();
+    g_s.selCategory.clear();
+    g_s.selWeapon.clear();
+    g_s.selPaintKit = -1;
+    g_s.editing = {};
+    g_s.editorOpen = false;
+    g_s.toggleVk = VK_INSERT;
+    g_s.showOffsetsStatus = false;
+    g_s.requestedTab.clear();
 }
 
 bool IsOpen() { return g_open; }
 State& Get()  { return g_s; }
 
 void Tick() {
-    const bool nowDown = (GetAsyncKeyState(g_s.toggleVk) & 0x8000) != 0;
+    // Only sample the toggle when CS2 is the foreground window — otherwise
+    // INSERT typed in a chat window or editor would flip us.
+    HWND cs2 = FindWindowW(nullptr, L"Counter-Strike 2");
+    const bool fg = (cs2 != nullptr && GetForegroundWindow() == cs2);
+    const bool nowDown = fg && (GetAsyncKeyState(g_s.toggleVk) & 0x8000) != 0;
     if (nowDown && !g_togglePrev) g_open = !g_open;
     g_togglePrev = nowDown;
 
@@ -157,7 +156,7 @@ void Tick() {
     if (!g_styleApplied) { ApplyCleanStyle(); g_styleApplied = true; }
 
     // Centred default position, bounded default size — never full-screen,
-    // never off-screen, always resizable, always closable via our X.
+    // never off-screen. INSERT is the only close path.
     const ImVec2 defSize{ 760, 520 };
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     const ImVec2 defPos{ (display.x - defSize.x) * 0.5f,
@@ -174,20 +173,27 @@ void Tick() {
         ImGuiWindowFlags_NoScrollWithMouse;
 
     if (ImGui::Begin("##cheat_main", nullptr, flags)) {
-        // Custom top bar: title left, X right.
+        // Top strip: title only. INSERT toggles the menu — no in-window X,
+        // the only close chrome belongs to the loader (native Win32).
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.92f, 0.94f, 1.0f));
-        ImGui::Text("skinloader");
+        ImGui::Text("skinloader   [INSERT to close]");
         ImGui::PopStyleColor();
-        if (DrawCloseX()) g_open = false;
 
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
 
         if (ImGui::BeginTabBar("##tabs")) {
-            if (ImGui::BeginTabItem("Inventory")) { DrawInventoryTab(); ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem("Add Item"))  { DrawAddItemTab();   ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem("Settings"))  { DrawSettingsTab();  ImGui::EndTabItem(); }
+            auto tabFlags = [](const char* name) -> ImGuiTabItemFlags {
+                if (g_s.requestedTab == name) {
+                    g_s.requestedTab.clear();
+                    return ImGuiTabItemFlags_SetSelected;
+                }
+                return 0;
+            };
+            if (ImGui::BeginTabItem("Inventory", nullptr, tabFlags("Inventory"))) { DrawInventoryTab(); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Add Item",  nullptr, tabFlags("Add Item")))  { DrawAddItemTab();   ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Settings",  nullptr, tabFlags("Settings")))  { DrawSettingsTab();  ImGui::EndTabItem(); }
             ImGui::EndTabBar();
         }
     }

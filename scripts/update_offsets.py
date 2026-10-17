@@ -19,7 +19,7 @@ from urllib.request import urlopen
 
 
 DEFAULT_OFFSETS_URL = "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/offsets.json"
-DEFAULT_SCHEMA_URL  = "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/client.dll.json"
+DEFAULT_SCHEMA_URL  = "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output/client_dll.json"
 
 HEADER = Path(__file__).resolve().parent.parent / "common" / "offsets.hpp"
 
@@ -128,7 +128,8 @@ def main() -> int:
     else:
         HEADER.write_text(new_text, encoding="utf-8")
         print(f"wrote {HEADER} ({len(resolved) - len(missing)} resolved, {len(missing)} TODO)")
-    return 0
+    # Non-zero exit on any unresolved field so CI/users notice.
+    return 1 if missing else 0
 
 
 if __name__ == "__main__":

