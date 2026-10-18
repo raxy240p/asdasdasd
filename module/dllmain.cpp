@@ -88,11 +88,25 @@ void Teardown() {
 
 } // namespace
 
+// Dedicated boot thread. The injector hijacks a game thread and jumps it
+// into sk_init via a shim; running Boot's heavy work (filesystem, dummy
+// swap-chain creation, sig scans) on that hijacked thread kept it off
+// the game loop for ~100ms+ and left any lock it held unreachable to the
+// rest of the game. Freeze-while-booting was almost certainly this. The
+// hijacked thread is now in-and-out — it spawns the worker and returns
+// to its original RIP within a few hundred cycles.
+DWORD WINAPI BootThread(LPVOID) {
+    Boot();
+    return 0;
+}
+
 extern "C" __declspec(dllexport) void sk_init() {
     static bool booted = false;
     if (booted) return;
     booted = true;
-    Boot();
+    HANDLE th = CreateThread(nullptr, 0, &BootThread, nullptr, 0, nullptr);
+    if (th) CloseHandle(th);
+    else    Boot();   // last-resort inline fallback — better slow than silent
 }
 
 BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {

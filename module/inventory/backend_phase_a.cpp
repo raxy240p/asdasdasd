@@ -358,27 +358,13 @@ void ResolveKnifeFns() {
     g_econItemViewUpdateGated  = reinterpret_cast<FnEconItemViewUpdate>(
         resolveDirect(sigs::SIG_EconItemView_Update));
 
-    // Charm def-indexes via CEconItemSchema::GetAttributeDefinitionByName.
-    // Assumes the function takes just the name (CS2 publishes it as a
-    // __fastcall-looking method but the first non-this access is rcx=name
-    // on the dumped build — if that's wrong the SEH wrapper catches it).
-    auto* getAttrDef = reinterpret_cast<FnGetAttrDef>(
-        resolveDirect(sigs::SIG_GetAttributeDefinitionByName));
-    if (getAttrDef) {
-        // Two name variants seen across builds. First hit wins per field.
-        static const char* kNamesId[] = {
-            "set item keychain slot 0 id",
-            "keychain slot 0 id",
-        };
-        static const char* kNamesSeed[] = {
-            "set item keychain slot 0 pattern",
-            "set item keychain slot 0 seed",
-            "keychain slot 0 pattern",
-            "keychain slot 0 seed",
-        };
-        for (auto* n : kNamesId)   if ((g_charmIdDef     = ProbeAttrDef(getAttrDef, n))) break;
-        for (auto* n : kNamesSeed) if ((g_charmPatternDef = ProbeAttrDef(getAttrDef, n))) break;
-    }
+    // Charm def-index probe DISABLED. Calling GetAttributeDefinitionByName
+    // from the game thread without a verified schema `this` pointer can
+    // acquire a schema mutex before the AV lands — SEH can't release
+    // mutexes, so a bad call deadlocks the game thread (freeze -> crash).
+    // Charms stay off until a schema-instance sig lands; bit 10 keeps
+    // Degraded showing "charm reverse pending" in the UI.
+    (void)ProbeAttrDef; // reserved for future revival
 
     // Diagnostic bits so the Settings tab shows which legs of the knife
     // flow are offline on this build.
@@ -514,49 +500,70 @@ bool ApplyAttributes(void* view, const cheat::items::ItemConfig& it) {
 //   m_bDisallowSOC    = true
 // Caller passes `weapon` so we can write fallback fields that live on
 // C_EconEntity (the weapon itself), not on the embedded item view.
+// SEH-wrapped core of the per-view write. Every single store sits inside
+// one __try so an off-by-one on any offset becomes "skip this weapon this
+// frame" instead of "corrupt the game and crash." The compiler isn't
+// allowed to insert C++ destructors inside __try — all locals here are
+// strictly POD.
+bool ApplyToViewSEH(void* weapon, void* view, const cheat::items::ItemConfig& it) {
+    __try {
+        if (offsets::m_iItemDefinitionIndex)
+            *At<std::uint16_t>(view, offsets::m_iItemDefinitionIndex) = it.definitionIndex;
+
+        if (offsets::m_iItemID) {
+            *At<std::uint64_t>(view, offsets::m_iItemID) = offsets::kClientSideItemID;
+            *At<std::uint32_t>(view, offsets::m_iItemIDHigh) =
+                static_cast<std::uint32_t>(offsets::kClientSideItemID >> 32);
+            *At<std::uint32_t>(view, offsets::m_iItemIDLow)  =
+                static_cast<std::uint32_t>(offsets::kClientSideItemID & 0xFFFFFFFFu);
+        }
+        if (offsets::m_iAccountID)
+            *At<std::uint32_t>(view, offsets::m_iAccountID) = 0;
+        if (offsets::m_iEntityQuality)
+            *At<std::uint32_t>(view, offsets::m_iEntityQuality) = 4;
+        if (offsets::m_bInitialized)
+            *At<bool>(view, offsets::m_bInitialized) = true;
+        if (offsets::m_bDisallowSOC)
+            *At<bool>(view, offsets::m_bDisallowSOC) = true;
+        if (offsets::m_szCustomName) {
+            auto* dst = At<char>(view, offsets::m_szCustomName);
+            std::memset(dst, 0, 32);
+            // customName.size() is 33 (array<char,33>) — cap at 31 to
+            // leave a null terminator at [31] after the memset above
+            // (the 32nd byte stays 0 as a defensive null).
+            const std::size_t n = it.customName.size();
+            const std::size_t copy = (n > 31) ? 31 : n;
+            std::memcpy(dst, it.customName.data(), copy);
+        }
+
+        if (weapon) {
+            if (offsets::m_nFallbackPaintKit)
+                *At<std::int32_t>(weapon, offsets::m_nFallbackPaintKit) = it.paintKit;
+            if (offsets::m_nFallbackSeed)
+                *At<std::int32_t>(weapon, offsets::m_nFallbackSeed)     = it.seed;
+            if (offsets::m_flFallbackWear)
+                *At<float>(weapon, offsets::m_flFallbackWear)           = it.wear;
+            if (offsets::m_nFallbackStatTrak)
+                *At<std::int32_t>(weapon, offsets::m_nFallbackStatTrak) = it.statTrak;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
 bool ApplyToView(void* weapon, void* view, const cheat::items::ItemConfig& it) {
     if (!view) return false;
-
-    if (offsets::m_iItemDefinitionIndex)
-        *At<std::uint16_t>(view, offsets::m_iItemDefinitionIndex) = it.definitionIndex;
-
-    // Client-side identity (step 2).
-    if (offsets::m_iItemID) {
-        *At<std::uint64_t>(view, offsets::m_iItemID) = offsets::kClientSideItemID;
-        *At<std::uint32_t>(view, offsets::m_iItemIDHigh) =
-            static_cast<std::uint32_t>(offsets::kClientSideItemID >> 32);
-        *At<std::uint32_t>(view, offsets::m_iItemIDLow)  =
-            static_cast<std::uint32_t>(offsets::kClientSideItemID & 0xFFFFFFFFu);
+    if (!ApplyToViewSEH(weapon, view, it)) {
+        // Mark Degraded bit 16 so the UI shows an offset layout mismatch.
+        g_ipc.degraded_mask |= (1u << 16);
+        return false;
     }
-    if (offsets::m_iAccountID)
-        *At<std::uint32_t>(view, offsets::m_iAccountID) = 0;
-    if (offsets::m_iEntityQuality)
-        *At<std::uint32_t>(view, offsets::m_iEntityQuality) = 4;
-    if (offsets::m_bInitialized)
-        *At<bool>(view, offsets::m_bInitialized) = true;
-    if (offsets::m_bDisallowSOC)
-        *At<bool>(view, offsets::m_bDisallowSOC) = true;
-    if (offsets::m_szCustomName) {
-        auto* dst = At<char>(view, offsets::m_szCustomName);
-        std::memset(dst, 0, 32);
-        std::memcpy(dst, it.customName.data(),
-                    (std::min)(it.customName.size(), size_t{32}));
-    }
-
-    // Fallback fields live on C_EconEntity (the weapon), not the view.
-    if (weapon) {
-        if (offsets::m_nFallbackPaintKit)
-            *At<std::int32_t>(weapon, offsets::m_nFallbackPaintKit) = it.paintKit;
-        if (offsets::m_nFallbackSeed)
-            *At<std::int32_t>(weapon, offsets::m_nFallbackSeed)     = it.seed;
-        if (offsets::m_flFallbackWear)
-            *At<float>(weapon, offsets::m_flFallbackWear)           = it.wear;
-        if (offsets::m_nFallbackStatTrak)
-            *At<std::int32_t>(weapon, offsets::m_nFallbackStatTrak) = it.statTrak;
-    }
-
     const bool attrsOk = ApplyAttributes(view, it);
-    if (g_econItemViewUpdateGated) g_econItemViewUpdateGated(view);
+    // g_econItemViewUpdateGated call deliberately DROPPED here — it's
+    // the biggest unverified function in the chain and may acquire
+    // internal locks the way GetAttributeDefinitionByName does. CS2's
+    // tick-driven OnDataChanged picks the writes up anyway.
     return attrsOk;
 }
 
@@ -571,56 +578,43 @@ bool IsKnifeDef(std::uint16_t def);
 // pointer — stale entries are harmless, the compare still fails.
 std::unordered_map<void*, std::uint16_t> g_lastKnifeDef;
 
-// Full knife MODEL swap (cs2-sdk.com flow, steps 2-6):
-//  1. m_iItemDefinitionIndex = target def (already written in ApplyToView)
-//  2. m_iEntityQuality = 3 (already written)
-//  3. m_nSubclassID = MurmurHash2(def_decimal, 0x31415926) ON THE WEAPON
-//  4. ApplyEconCustomization(weapon, 1) — queue econ reload
-//  5. UpdateCompositeMaterialSet(weapon, 1) — regenerate skin
-//  6. InvalidateDescription(view) — refresh HUD name
-// User spec step 7: only re-fire when the game has rebuilt over us, else
-// the asynchronous rebuild gets cancelled.
+// Knife MODEL swap — gated behind cheat::menu::State::enableKnifeSwap, OFF
+// by default. The feature requires calling three unverified functions
+// (ApplyEconCustomization, UpdateCompositeMaterialSet, InvalidateDesc)
+// which can freeze or crash CS2 if the sigs are stale or the called code
+// acquires a mutex. Users opt in from the Settings tab once paint-only
+// is confirmed working.
 void MaybeKnifeSwap(void* weapon, void* view, const cheat::items::ItemConfig& it) {
     if (it.category != cheat::items::Category::Knife) return;
     if (!IsKnifeDef(it.definitionIndex))              return;
+    if (!cheat::menu::Get().enableKnifeSwap)          return;
 
     auto it_cache = g_lastKnifeDef.find(weapon);
     if (it_cache != g_lastKnifeDef.end() && it_cache->second == it.definitionIndex) {
-        // Live def still matches what we last swapped to — the rebuild is
-        // either in flight or already finished. Don't re-fire.
         if (offsets::m_iItemDefinitionIndex) {
-            const std::uint16_t live =
-                *At<std::uint16_t>(view, offsets::m_iItemDefinitionIndex);
-            if (live == it.definitionIndex) return;
+            __try {
+                const std::uint16_t live =
+                    *At<std::uint16_t>(view, offsets::m_iItemDefinitionIndex);
+                if (live == it.definitionIndex) return;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
         }
     }
 
-    // Step 3: subclass hash on the WEAPON (C_BaseEntity), not the view.
-    if (offsets::m_nSubclassID) {
-        *At<std::uint32_t>(weapon, offsets::m_nSubclassID) =
-            SubclassHashForDef(it.definitionIndex);
+    __try {
+        if (offsets::m_nSubclassID) {
+            *At<std::uint32_t>(weapon, offsets::m_nSubclassID) =
+                SubclassHashForDef(it.definitionIndex);
+        }
+        if (offsets::m_nCustomEconReloadEventId) {
+            *At<std::int32_t>(weapon, offsets::m_nCustomEconReloadEventId) = -1;
+        }
+        if (g_applyEconGated)          g_applyEconGated(weapon, 1);
+        if (g_updateCompositeSetGated) g_updateCompositeSetGated(weapon, 1);
+        if (g_invalidateDescGated)     g_invalidateDescGated(view);
+        g_lastKnifeDef[weapon] = it.definitionIndex;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_ipc.degraded_mask |= (1u << 17);  // "knife swap AV'd"
     }
-    // Reset the reload gate so ApplyEconCustomization actually runs its
-    // async rebuild (spec step 5: m_nCustomEconReloadEventId = -1 before
-    // the rebuild). Without this, the game sees an in-flight reload id
-    // and skips our request.
-    if (offsets::m_nCustomEconReloadEventId) {
-        *At<std::int32_t>(weapon, offsets::m_nCustomEconReloadEventId) = -1;
-    }
-    // Step 4: queue econ reload.
-    if (g_applyEconGated) g_applyEconGated(weapon, 1);
-    // Step 5 (merged): full composite regen on the weapon. Previously had
-    // a step 5a that called UpdateCompositeMaterial on weapon+0x610 (the
-    // composite set) when the live-count at +0x4A0 was non-zero, but those
-    // offsets are build-specific and an in-place call with a wrong pointer
-    // can corrupt renderer state before the SEH wrapper catches anything.
-    // Step 5b's full regen covers the common path on its own; dropping 5a
-    // reduces blast radius with no visible regression.
-    if (g_updateCompositeSetGated) g_updateCompositeSetGated(weapon, 1);
-    // Step 6: HUD name refresh.
-    if (g_invalidateDescGated) g_invalidateDescGated(view);
-
-    g_lastKnifeDef[weapon] = it.definitionIndex;
 }
 
 // Known paintable knife def-indexes. Lets a Knife config apply to whatever
@@ -669,19 +663,23 @@ public:
         if (haveWeapons) {
             auto* handles = static_cast<std::uint32_t*>(myWeapons->memory);
             for (int i = 0; i < myWeapons->size; ++i) {
-                auto* weapon = ResolveHandle(handles[i]);
-                if (!weapon) continue;
-                auto* view = ItemViewFromWeapon(weapon);
-                if (!view) continue;
-
-                std::uint16_t def = *At<std::uint16_t>(view, offsets::m_iItemDefinitionIndex);
-                const auto* cfg = PickForDef(items, def);
-                if (!cfg) continue;
-                ApplyToView(weapon, view, *cfg);
-                // Full knife model+subclass+composite rebuild — paint alone
-                // keeps the server-spawned model, so this is what makes the
-                // Karambit visible when the player bought a Bayonet.
-                MaybeKnifeSwap(weapon, view, *cfg);
+                // SEH-wrap the whole per-weapon body. The def-index read at
+                // view+0x1BA can AV if the weapon pointer is stale (handle
+                // slot reuse race the ResolveHandle fence may miss on a
+                // schema shift). On AV we skip this weapon this frame.
+                __try {
+                    auto* weapon = ResolveHandle(handles[i]);
+                    if (!weapon) continue;
+                    auto* view = ItemViewFromWeapon(weapon);
+                    if (!view) continue;
+                    std::uint16_t def = *At<std::uint16_t>(view, offsets::m_iItemDefinitionIndex);
+                    const auto* cfg = PickForDef(items, def);
+                    if (!cfg) continue;
+                    ApplyToView(weapon, view, *cfg);
+                    MaybeKnifeSwap(weapon, view, *cfg);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    g_ipc.degraded_mask |= (1u << 18);
+                }
             }
         }
 

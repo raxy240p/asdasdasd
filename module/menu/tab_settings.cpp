@@ -47,6 +47,11 @@ void DrawSettingsTab() {
     if (ImGui::Button("Reload config")) LoadConfig();
 
     ImGui::Separator();
+    ImGui::Checkbox("Enable Knife MODEL swap (experimental)", &S.enableKnifeSwap);
+    ImGui::TextDisabled("Off = paint only. On = full def+subclass+composite "
+                        "rebuild. May freeze/crash on build mismatch.");
+
+    ImGui::Separator();
     ImGui::Checkbox("Show offset/hook debug", &S.showOffsetsStatus);
 
     if (S.showOffsetsStatus) {
