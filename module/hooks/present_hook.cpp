@@ -44,6 +44,10 @@ std::atomic<bool> g_inPresent{ false };
 // side; our own code never calls the trampoline directly).
 constexpr std::size_t kPatchLen = 5;
 
+// Namespace-scope so lambdas don't need an explicit capture to reach it
+// (MSVC /permissive- rejects implicit capture of a constexpr local array).
+constexpr std::uint8_t kDxgiPrologue[kPatchLen] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
+
 bool Fits32(std::intptr_t delta) {
     return delta >= -0x80000000LL && delta < 0x80000000LL;
 }
@@ -172,7 +176,6 @@ bool InstallPresent() {
     // `48 89 5C 24 08` (mov [rsp+8], rbx) before copying. Any mismatch
     // would mean mid-instruction split on the stolen-byte path and a crash
     // first time the trampoline is called.
-    constexpr std::uint8_t kDxgiPrologue[5] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
     auto prologueOk = [](void* target) {
         return std::memcmp(target, kDxgiPrologue, kPatchLen) == 0;
     };

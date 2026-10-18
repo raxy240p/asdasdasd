@@ -533,6 +533,11 @@ bool ApplyToView(void* view, const cheat::items::ItemConfig& it) {
     return attrsOk;
 }
 
+// Forward decl so MaybeKnifeSwap below (added in this file after ApplyToView)
+// can reach the knife-def test, which is physically defined further down
+// alongside PickForDef. Cheaper than reordering the whole bottom half.
+bool IsKnifeDef(std::uint16_t def);
+
 // Per-weapon memory of the knife def we last swapped TO. Lets us detect
 // when the game has rebuilt the weapon over us (def no longer matches, or
 // weapon pointer never seen) and re-fire the rebuild. Keyed by weapon
@@ -573,14 +578,21 @@ void MaybeKnifeSwap(void* weapon, void* view, const cheat::items::ItemConfig& it
     // Step 5a: in-place composite rebuild (spec: "if the weapon already
     // has composite materials, UpdateCompositeMaterial on its composite
     // set"). Composite set lives at weapon+0x610 with live material count
-    // at +0x4A0 — skip when count is 0, nothing to rebuild yet.
+    // at +0x4A0 — skip when count is 0, nothing to rebuild yet. SEH-wrap
+    // the probe since the offsets are build-specific; an AV here would
+    // kill the game. On any fault we skip the in-place rebuild and let
+    // step 5b's full regen do the work.
     constexpr std::ptrdiff_t kCompositeSetOff = 0x610;
     constexpr std::ptrdiff_t kLiveCountOff    = 0x4A0;
     if (g_updateCompositeGated) {
         auto* compositeSet = At<std::uint8_t>(weapon, kCompositeSetOff);
-        const std::uint32_t live =
-            *reinterpret_cast<std::uint32_t*>(compositeSet + kLiveCountOff);
-        if (live != 0) g_updateCompositeGated(compositeSet);
+        __try {
+            const std::uint32_t live =
+                *reinterpret_cast<std::uint32_t*>(compositeSet + kLiveCountOff);
+            if (live != 0) g_updateCompositeGated(compositeSet);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // skip; step 5b still runs
+        }
     }
     // Step 5b: full composite regen on the weapon.
     if (g_updateCompositeSetGated) g_updateCompositeSetGated(weapon, 1);
