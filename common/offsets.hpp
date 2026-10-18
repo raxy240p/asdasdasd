@@ -103,19 +103,27 @@ enum : std::uint16_t { kStk_Id = 0, kStk_Wear = 1, kStk_Scale = 2, kStk_Rotation
 // visible in the Settings tab rather than silently no-oping.
 //
 // Searched (all empty for an *attribute* def-index pair):
-//   * cs2-dumper client_dll.json: C_KeychainModule exists but exposes
-//     *struct* offsets (m_nKeychainDefID@0x1270, m_nKeychainSeed@0x1274),
-//     NOT attribute def-indexes. InventoryNodeType_t enum has
-//     CONCRETE_NODE_SCHEMA_KEYCHAIN=8 / VIRTUAL_NODE_SCHEMA_KEYCHAIN=4 —
-//     node-type ids, also not attribute def-indexes.
+//   * cs2-dumper client_dll.json: C_KeychainModule exposes struct offsets
+//     (m_nKeychainDefID@0x1270, m_nKeychainSeed@0x1274), NOT attribute
+//     def-indexes. InventoryNodeType_t enum has node-type ids, also not
+//     attribute def-indexes.
 //   * cs2-dumper offsets.json: no keychain / charm entries.
-// Next place to look: GameTracking-CS2/game/csgo/pak01_dir/scripts/items/
-// items_game.txt attributes block — grep for "keychain" / "set item
-// keychain" / "keychain id" / "keychain pattern". File is ~8MB; use
-// WebFetch offsets in the millions. ByMykel/CSGO-API also mirrors the
-// attribute list in a smaller form.
-inline constexpr std::uint16_t kAttrDef_CharmId      = 0;   // TODO verify from items_game.txt
-inline constexpr std::uint16_t kAttrDef_CharmPattern = 0;   // TODO verify from items_game.txt
+//   * GameTracking-CS2/game/csgo/pak01_dir/scripts/items/items_game.txt
+//     scanned at offsets 0/300K/900K/1M/2M/2.5M/7M/7.5M: paint_kits,
+//     items, sticker_kits, keychain-crate items (ids 5323-5328) all
+//     present, but CS2 no longer publishes a top-level `attributes`
+//     block with explicit def_index values — attribute definitions were
+//     moved into the compiled client schema. items_game.txt is NOT the
+//     source for CS2; do not look there again.
+//
+// Real resolution path (needs a runtime reverse, not a static fetch):
+//   1. CEconItemSchema::GetAttributeDefinitionByName in client.dll,
+//      called with names like "set item keychain slot 0 id" / "...pattern".
+//      The returned def pointer carries the uint16 index.
+//   2. Alt: walk the SchemaSystem RTTI registry at runtime and pull the
+//      keychain attribute names → def-index map.
+inline constexpr std::uint16_t kAttrDef_CharmId      = 0;   // TODO reverse via CEconItemSchema registry
+inline constexpr std::uint16_t kAttrDef_CharmPattern = 0;   // TODO reverse via CEconItemSchema registry
 
 // ---- gloves ----
 // Dumper exposes C_CSPlayerPawn::m_EconGloves (embedded C_EconItemView).
