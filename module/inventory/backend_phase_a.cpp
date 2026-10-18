@@ -409,17 +409,20 @@ public:
             }
         }
 
-        // Diagnostic: if the inventory carries any charm attributes and the
-        // charm def-indexes haven't been reversed yet, surface it in the
-        // Settings offset-status panel. Non-fatal.
+        // Diagnostic bit 10: inventory carries charm attributes but the
+        // charm def-indexes aren't reversed yet. Recompute each apply so
+        // removing the charm clears the signal (previously stuck once set).
+        constexpr std::uint32_t kCharmDegradedBit = (1u << 10);
+        bool hasPendingCharm = false;
         if (!offsets::kAttrDef_CharmId) {
             for (const auto& it : items) {
                 if (it.charm.charmId != 0 || it.charm.pattern != 0) {
-                    g_ipc.degraded_mask |= (1u << 10);
-                    break;
+                    hasPendingCharm = true; break;
                 }
             }
         }
+        if (hasPendingCharm) g_ipc.degraded_mask |=  kCharmDegradedBit;
+        else                 g_ipc.degraded_mask &= ~kCharmDegradedBit;
 
         return anyApplied;
     }

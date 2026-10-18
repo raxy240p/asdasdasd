@@ -213,7 +213,17 @@ void DrawPaintList(State& S, float width) {
             ImGui::SameLine(ImGui::GetContentRegionMax().x - 70);
             if (ImGui::Button("Select", {60, 44})) {
                 S.editing = {};
-                S.editing.category        = cheat::items::Category::Custom;
+                // Map weapon-category name → ItemConfig::category so Phase-B
+                // can route to the right apply path (gloves hit the embedded
+                // pawn+m_EconGloves view, not the m_hMyWeapons walk).
+                S.editing.category =
+                    (S.selCategory == "Gloves")  ? cheat::items::Category::Glove  :
+                    (S.selCategory == "Knives")  ? cheat::items::Category::Knife  :
+                    (S.selCategory == "Rifles")  ? cheat::items::Category::Rifle  :
+                    (S.selCategory == "SMGs")    ? cheat::items::Category::SMG    :
+                    (S.selCategory == "Pistols") ? cheat::items::Category::Pistol :
+                    (S.selCategory == "Heavy")   ? cheat::items::Category::Heavy  :
+                                                   cheat::items::Category::Custom;
                 S.editing.definitionIndex = weap.defIndex;
                 S.editing.paintKit        = p->kit;
                 S.editing.wear            = (p->finishMin + p->finishMax) * 0.5f;
