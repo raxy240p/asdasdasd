@@ -1,5 +1,6 @@
 #include "menu.hpp"
 #include "../../common/json.hpp"
+#include "../render/dx11_setup.hpp"
 
 #include <imgui.h>
 #include <windows.h>
@@ -26,7 +27,7 @@ void ApplyCleanStyle() {
     auto& s  = ImGui::GetStyle();
     auto& co = s.Colors;
 
-    s.WindowRounding    = 6.0f;
+    s.WindowRounding    = 8.0f;
     s.ChildRounding     = 4.0f;
     s.FrameRounding     = 4.0f;
     s.PopupRounding     = 4.0f;
@@ -35,9 +36,9 @@ void ApplyCleanStyle() {
     s.TabRounding       = 4.0f;
     s.WindowBorderSize  = 0.0f;
     s.FrameBorderSize   = 0.0f;
-    s.WindowPadding     = ImVec2(12, 12);
+    s.WindowPadding     = ImVec2(10, 10);
     s.FramePadding      = ImVec2(8, 4);
-    s.ItemSpacing       = ImVec2(8, 6);
+    s.ItemSpacing       = ImVec2(7, 5);
     s.ItemInnerSpacing  = ImVec2(6, 4);
     s.ScrollbarSize     = 12.0f;
 
@@ -175,9 +176,12 @@ void Tick() {
     if (ImGui::Begin("##cheat_main", nullptr, flags)) {
         // Top strip: title only. INSERT toggles the menu — no in-window X,
         // the only close chrome belongs to the loader (native Win32).
+        ImFont* hf = cheat::render::GetHeaderFont();
+        if (hf) ImGui::PushFont(hf);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.92f, 0.94f, 1.0f));
         ImGui::Text("skinloader   [INSERT to close]");
         ImGui::PopStyleColor();
+        if (hf) ImGui::PopFont();
 
         ImGui::Spacing();
         ImGui::Separator();

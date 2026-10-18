@@ -56,7 +56,11 @@ void DrawCategoryStrip(State& S) {
             (std::strcmp(cat, "Charms")   == 0 && !S.db.charms.empty())   ||
             (std::strcmp(cat, "Agents")   == 0 && !S.db.agents.empty())   ||
             (std::strcmp(cat, "Cases")    == 0 && !S.db.cases.empty())    ||
-            (std::strcmp(cat, "Keys")     == 0 && !S.db.keys.empty());
+            (std::strcmp(cat, "Keys")     == 0 && !S.db.keys.empty())     ||
+            (std::strcmp(cat, "Music Kits") == 0 && !S.db.musicKits.empty()) ||
+            (std::strcmp(cat, "Coins/Pins/Patches") == 0 && !S.db.coinsPinsPatches.empty()) ||
+            (std::strcmp(cat, "Graffiti") == 0 && !S.db.graffiti.empty()) ||
+            (std::strcmp(cat, "Pets")     == 0);  // label-only, always enabled
         const bool sel  = S.selCategory == cat;
 
         if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
@@ -117,6 +121,33 @@ void DrawWeaponList(State& S, float width) {
                 commit(n, cheat::items::Category::Key);
                 S.editing.definitionIndex = k.defIndex;
             }
+    } else if (S.selCategory == "Music Kits") {
+        for (const auto& [n, k] : S.db.musicKits)
+            if (ImGui::Selectable(n.c_str(), S.selWeapon == n)) {
+                commit(n, cheat::items::Category::MusicKit);
+                S.editing.definitionIndex = k.defIndex;
+            }
+    } else if (S.selCategory == "Coins/Pins/Patches") {
+        for (const auto& [n, k] : S.db.coinsPinsPatches)
+            if (ImGui::Selectable(n.c_str(), S.selWeapon == n)) {
+                commit(n, cheat::items::Category::Coin);
+                S.editing.definitionIndex = k.defIndex;
+            }
+    } else if (S.selCategory == "Graffiti") {
+        for (const auto& [n, k] : S.db.graffiti)
+            if (ImGui::Selectable(n.c_str(), S.selWeapon == n)) {
+                commit(n, cheat::items::Category::Graffiti);
+                S.editing.definitionIndex = k.defIndex;
+            }
+    } else if (S.selCategory == "Pets") {
+        ImGui::TextWrapped("Custom items only — define a def-index and paint kit by hand");
+        // Open the free-form editor once on entry; keep edits sticky after.
+        if (!S.editorOpen || S.editing.category != cheat::items::Category::Custom) {
+            S.editing = {};
+            S.editing.category = cheat::items::Category::Custom;
+            for (auto& s : S.editing.stickers) s.scale = 1.f;
+            S.editorOpen = true;
+        }
     } else {
         auto cit = S.db.categories.find(S.selCategory);
         if (cit == S.db.categories.end()) {
@@ -209,11 +240,21 @@ void DrawPreviewPane(State& S, float width) {
     }
     auto& it = S.editing;
 
+    // Tiny icon preview so users see what they're editing even when the
+    // big panorama isn't ready (missing render target, no cached image).
+    if (S.preview) S.preview->DrawIcon(it, {32, 32});
     const float side = (width > 48.0f) ? std::min(width - 24.0f, 260.0f) : 48.0f;
     if (S.preview) S.preview->DrawPanorama(it, {side, side});
     ImGui::Separator();
 
-    ImGui::Text("def %u · kit %d", it.definitionIndex, it.paintKit);
+    if (it.category == cheat::items::Category::Custom) {
+        int def = it.definitionIndex;
+        if (ImGui::InputInt("def-index", &def))
+            it.definitionIndex = static_cast<std::uint16_t>(std::clamp(def, 0, 65535));
+        ImGui::InputInt("paint kit", &it.paintKit);
+    } else {
+        ImGui::Text("def %u · kit %d", it.definitionIndex, it.paintKit);
+    }
     ImGui::SliderFloat("wear",  &it.wear, 0.f, 1.f, "%.3f");
     ImGui::SliderInt  ("seed",  &it.seed, 0, 1024);
 
@@ -224,6 +265,7 @@ void DrawPreviewPane(State& S, float width) {
     ImGui::Checkbox("Souvenir", &it.souvenir);
     ImGui::InputText("nametag", it.customName.data(), it.customName.size());
 
+    ImGui::Spacing();
     if (ImGui::CollapsingHeader("Stickers")) {
         for (int i = 0; i < 5; ++i) {
             ImGui::PushID(i);
@@ -238,6 +280,7 @@ void DrawPreviewPane(State& S, float width) {
             ImGui::PopID();
         }
     }
+    ImGui::Spacing();
     if (ImGui::CollapsingHeader("Charm")) {
         ImGui::InputInt("charm id", &it.charm.charmId, 0, 0);
         ImGui::InputInt("pattern",  &it.charm.pattern, 0, 0);
@@ -245,11 +288,18 @@ void DrawPreviewPane(State& S, float width) {
 
     ImGui::Spacing();
     const float bw = ImGui::GetContentRegionAvail().x;
+    const ImVec4 accent   = { 0.33f, 0.65f, 1.00f, 1.00f };
+    const ImVec4 accentHi = { 0.40f, 0.72f, 1.00f, 1.00f };
+    const ImVec4 accentLo = { 0.22f, 0.48f, 0.80f, 1.00f };
+    ImGui::PushStyleColor(ImGuiCol_Button,        accent);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, accentHi);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  accentLo);
     if (ImGui::Button("Add to Inventory", {bw, 32})) {
         S.inventory.push_back(it);
         S.dirty = true;
         S.editorOpen = false;
     }
+    ImGui::PopStyleColor(3);
 
     ImGui::EndChild();
 }

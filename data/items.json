@@ -17,11 +17,85 @@
           { "name": "Asiimov",     "kit": 255, "rarity": "covert",     "finish_quality_min": 0.18, "max": 1.00 }
         ]
       },
+      "M4A1-S": {
+        "def_index": 60,
+        "paints": [
+          { "name": "Hyper Beast", "kit": 429, "rarity": "covert",     "finish_quality_min": 0.00, "max": 1.00 }
+        ]
+      },
       "AWP": {
         "def_index": 9,
         "paints": [
           { "name": "Dragon Lore", "kit": 344, "rarity": "covert",     "finish_quality_min": 0.00, "max": 0.70 },
           { "name": "Asiimov",     "kit": 279, "rarity": "covert",     "finish_quality_min": 0.18, "max": 1.00 }
+        ]
+      },
+      "SG 553": {
+        "def_index": 39,
+        "paints": [
+          { "name": "Pulse",       "kit": 450, "rarity": "milspec",    "finish_quality_min": 0.00, "max": 1.00 }
+        ]
+      },
+      "AUG": {
+        "def_index": 8,
+        "paints": [
+          { "name": "Akihabara Accept", "kit": 391, "rarity": "covert", "finish_quality_min": 0.00, "max": 0.60 }
+        ]
+      },
+      "FAMAS": {
+        "def_index": 10,
+        "paints": [
+          { "name": "Afterimage",  "kit": 456, "rarity": "classified", "finish_quality_min": 0.00, "max": 0.75 }
+        ]
+      },
+      "Galil AR": {
+        "def_index": 13,
+        "paints": [
+          { "name": "Chatterbox",  "kit": 480, "rarity": "covert",     "finish_quality_min": 0.00, "max": 0.80 }
+        ]
+      }
+    },
+    "SMGs": {
+      "MP9": {
+        "def_index": 34,
+        "paints": [
+          { "name": "Hypnotic",    "kit": 36,  "rarity": "milspec",    "finish_quality_min": 0.00, "max": 0.70 }
+        ]
+      },
+      "MAC-10": {
+        "def_index": 17,
+        "paints": [
+          { "name": "Neon Rider",  "kit": 523, "rarity": "covert",     "finish_quality_min": 0.00, "max": 0.90 }
+        ]
+      },
+      "UMP-45": {
+        "def_index": 24,
+        "paints": [
+          { "name": "Primal Saber","kit": 395, "rarity": "classified", "finish_quality_min": 0.00, "max": 0.80 }
+        ]
+      },
+      "P90": {
+        "def_index": 19,
+        "paints": [
+          { "name": "Asiimov",     "kit": 283, "rarity": "covert",     "finish_quality_min": 0.18, "max": 1.00 }
+        ]
+      },
+      "PP-Bizon": {
+        "def_index": 26,
+        "paints": [
+          { "name": "High Roller", "kit": 568, "rarity": "classified", "finish_quality_min": 0.00, "max": 0.80 }
+        ]
+      },
+      "MP7": {
+        "def_index": 33,
+        "paints": [
+          { "name": "Nemesis",     "kit": 517, "rarity": "classified", "finish_quality_min": 0.00, "max": 0.60 }
+        ]
+      },
+      "MP5-SD": {
+        "def_index": 23,
+        "paints": [
+          { "name": "Phosphor",    "kit": 851, "rarity": "classified", "finish_quality_min": 0.00, "max": 1.00 }
         ]
       }
     },
@@ -31,6 +105,92 @@
         "paints": [
           { "name": "Blaze",       "kit": 141, "rarity": "restricted", "finish_quality_min": 0.00, "max": 0.08 }
         ]
+      },
+      "Glock-18": {
+        "def_index": 4,
+        "paints": [
+          { "name": "Fade",        "kit": 38,  "rarity": "covert",     "finish_quality_min": 0.00, "max": 0.08 }
+        ]
+      },
+      "USP-S": {
+        "def_index": 61,
+        "paints": [
+          { "name": "Kill Confirmed", "kit": 455, "rarity": "covert",  "finish_quality_min": 0.00, "max": 1.00 }
+        ]
+      },
+      "P250": {
+        "def_index": 36,
+        "paints": [
+          { "name": "Asiimov",     "kit": 294, "rarity": "classified", "finish_quality_min": 0.18, "max": 1.00 }
+        ]
+      },
+      "Tec-9": {
+        "def_index": 30,
+        "paints": [
+          { "name": "Nuclear Threat","kit": 215,"rarity": "classified","finish_quality_min": 0.00, "max": 0.80 }
+        ]
+      },
+      "Five-SeveN": {
+        "def_index": 3,
+        "paints": [
+          { "name": "Hyper Beast", "kit": 428, "rarity": "classified", "finish_quality_min": 0.00, "max": 1.00 }
+        ]
+      },
+      "CZ75-Auto": {
+        "def_index": 63,
+        "paints": [
+          { "name": "Victoria",    "kit": 371, "rarity": "classified", "finish_quality_min": 0.00, "max": 0.60 }
+        ]
+      },
+      "Dual Berettas": {
+        "def_index": 2,
+        "paints": [
+          { "name": "Cobra Strike","kit": 568, "rarity": "classified", "finish_quality_min": 0.00, "max": 0.70 }
+        ]
+      },
+      "R8 Revolver": {
+        "def_index": 64,
+        "paints": [
+          { "name": "Fade",        "kit": 644, "rarity": "classified", "finish_quality_min": 0.00, "max": 0.08 }
+        ]
+      }
+    },
+    "Heavy": {
+      "Nova": {
+        "def_index": 35,
+        "paints": [
+          { "name": "Hyper Beast", "kit": 574, "rarity": "classified", "finish_quality_min": 0.00, "max": 1.00 }
+        ]
+      },
+      "XM1014": {
+        "def_index": 25,
+        "paints": [
+          { "name": "Tranquility", "kit": 428, "rarity": "classified", "finish_quality_min": 0.00, "max": 0.70 }
+        ]
+      },
+      "MAG-7": {
+        "def_index": 27,
+        "paints": [
+          { "name": "Justice",     "kit": 452, "rarity": "classified", "finish_quality_min": 0.00, "max": 0.70 }
+        ]
+      },
+      "Sawed-Off": {
+        "def_index": 29,
+        "paints": [
+          { "name": "The Kraken",  "kit": 572, "rarity": "covert",     "finish_quality_min": 0.00, "max": 0.80 }
+        ]
+      },
+      "M249": {
+        "def_index": 14,
+        "paints": [
+          { "name": "Nebula Crusader","kit": 575,"rarity":"milspec",   "finish_quality_min": 0.00, "max": 1.00 }
+        ]
+      },
+      "Negev": {
+        "def_index": 28,
+        "paints": [
+          { "name": "Mjölnir",     "kit": 592, "rarity": "covert",     "finish_quality_min": 0.00, "max": 1.00 }
+        ]
       }
     },
     "Knives": {
@@ -39,6 +199,62 @@
         "paints": [
           { "name": "Fade",        "kit": 38,  "rarity": "exceedingly_rare", "finish_quality_min": 0.00, "max": 0.08 },
           { "name": "Doppler",     "kit": 416, "rarity": "exceedingly_rare", "finish_quality_min": 0.00, "max": 0.08 }
+        ]
+      },
+      "Bayonet": {
+        "def_index": 500,
+        "paints": [
+          { "name": "Fade",        "kit": 38,  "rarity": "exceedingly_rare", "finish_quality_min": 0.00, "max": 0.08 }
+        ]
+      },
+      "Flip Knife": {
+        "def_index": 505,
+        "paints": [
+          { "name": "Doppler",     "kit": 417, "rarity": "exceedingly_rare", "finish_quality_min": 0.00, "max": 0.08 }
+        ]
+      },
+      "Butterfly Knife": {
+        "def_index": 515,
+        "paints": [
+          { "name": "Fade",        "kit": 38,  "rarity": "exceedingly_rare", "finish_quality_min": 0.00, "max": 0.08 }
+        ]
+      },
+      "M9 Bayonet": {
+        "def_index": 508,
+        "paints": [
+          { "name": "Doppler",     "kit": 418, "rarity": "exceedingly_rare", "finish_quality_min": 0.00, "max": 0.08 }
+        ]
+      }
+    },
+    "Gloves": {
+      "Sport Gloves": {
+        "def_index": 5030,
+        "paints": [
+          { "name": "Pandora's Box","kit": 10038, "rarity": "exceedingly_rare", "finish_quality_min": 0.06, "max": 0.80 }
+        ]
+      },
+      "Driver Gloves": {
+        "def_index": 5034,
+        "paints": [
+          { "name": "Lunar Weave", "kit": 10040, "rarity": "exceedingly_rare", "finish_quality_min": 0.06, "max": 0.80 }
+        ]
+      },
+      "Specialist Gloves": {
+        "def_index": 5035,
+        "paints": [
+          { "name": "Crimson Kimono","kit":10036, "rarity": "exceedingly_rare", "finish_quality_min": 0.06, "max": 0.80 }
+        ]
+      },
+      "Moto Gloves": {
+        "def_index": 5033,
+        "paints": [
+          { "name": "Spearmint",   "kit": 10033, "rarity": "exceedingly_rare", "finish_quality_min": 0.06, "max": 0.80 }
+        ]
+      },
+      "Hand Wraps": {
+        "def_index": 5032,
+        "paints": [
+          { "name": "Slaughter",   "kit": 10039, "rarity": "exceedingly_rare", "finish_quality_min": 0.06, "max": 0.80 }
         ]
       }
     }
