@@ -97,10 +97,25 @@ inline constexpr std::uint16_t kAttrDef_StickerSlotBase = 113;
 inline constexpr std::size_t   kStickerSlotCount = 5;
 // Per-slot sub-attribute offsets within the slot block.
 enum : std::uint16_t { kStk_Id = 0, kStk_Wear = 1, kStk_Scale = 2, kStk_Rotation = 3 };
-// Charm (CS2 keychain) uses a different attribute surface; needs reversing
-// confirmation per build. Left as placeholder def-indexes.
-inline constexpr std::uint16_t kAttrDef_CharmId      = 0;   // TODO verify
-inline constexpr std::uint16_t kAttrDef_CharmPattern = 0;   // TODO verify
+// Charm (CS2 keychain) uses a different attribute surface. Left at 0;
+// Phase-B guards on `if (offsets::kAttrDef_CharmId)` and sets the Charm
+// Degraded bit (1<<10) when inventory carries pending charms, so this is
+// visible in the Settings tab rather than silently no-oping.
+//
+// Searched (all empty for an *attribute* def-index pair):
+//   * cs2-dumper client_dll.json: C_KeychainModule exists but exposes
+//     *struct* offsets (m_nKeychainDefID@0x1270, m_nKeychainSeed@0x1274),
+//     NOT attribute def-indexes. InventoryNodeType_t enum has
+//     CONCRETE_NODE_SCHEMA_KEYCHAIN=8 / VIRTUAL_NODE_SCHEMA_KEYCHAIN=4 —
+//     node-type ids, also not attribute def-indexes.
+//   * cs2-dumper offsets.json: no keychain / charm entries.
+// Next place to look: GameTracking-CS2/game/csgo/pak01_dir/scripts/items/
+// items_game.txt attributes block — grep for "keychain" / "set item
+// keychain" / "keychain id" / "keychain pattern". File is ~8MB; use
+// WebFetch offsets in the millions. ByMykel/CSGO-API also mirrors the
+// attribute list in a smaller form.
+inline constexpr std::uint16_t kAttrDef_CharmId      = 0;   // TODO verify from items_game.txt
+inline constexpr std::uint16_t kAttrDef_CharmPattern = 0;   // TODO verify from items_game.txt
 
 // ---- gloves ----
 // Dumper exposes C_CSPlayerPawn::m_EconGloves (embedded C_EconItemView).
