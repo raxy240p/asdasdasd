@@ -353,7 +353,8 @@ int Run(HINSTANCE hInst) {
                 // report success. Previously set to 0, which meant the
                 // launcher reported "injected ok" without any confirmation
                 // the module had even reached the Present hook.
-                std::uint64_t ipcRva = 0;
+                // 32-bit matches Options::readyFlagRva and PE RVAs.
+                std::uint32_t ipcRva = 0;
                 {
                     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(bytes.data());
                     if (bytes.size() > sizeof(IMAGE_DOS_HEADER) &&
@@ -430,7 +431,7 @@ int Run(HINSTANCE hInst) {
                     S.stage = Stage::Fail; S.failMsg = r.stage + ": " + r.message;
                     LogLine(S.failMsg.c_str());
                 }
-                std::fill(bytes.begin(), bytes.end(), 0);
+                std::fill(bytes.begin(), bytes.end(), std::uint8_t{0});
             }
         }
         if (!canInject) ImGui::EndDisabled();

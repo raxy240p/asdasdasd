@@ -62,10 +62,23 @@ std::wstring& CachedClass() { static std::wstring s; return s; }
 std::string&  CachedImGui() { static std::string  s; return s; }
 
 std::wstring ToUtf16(const std::string& narrow) {
-    std::wstring w(narrow.begin(), narrow.end()); return w;
+    // ASCII fast path (random-name pool is Latin-only); explicit cast
+    // silences C4244 under /W4 without a MultiByteToWideChar dependency.
+    std::wstring w;
+    w.reserve(narrow.size());
+    for (char c : narrow) w.push_back(static_cast<wchar_t>(static_cast<unsigned char>(c)));
+    return w;
 }
 std::string ToUtf8(const std::wstring& wide) {
-    std::string s(wide.begin(), wide.end()); return s;
+    // Same story — our pool is Latin, so a byte truncation IS the right
+    // conversion. The explicit cast silences C4244; a non-ASCII wchar
+    // becomes '?' instead of a half-char.
+    std::string s;
+    s.reserve(wide.size());
+    for (wchar_t c : wide) {
+        s.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+    }
+    return s;
 }
 
 } // namespace
