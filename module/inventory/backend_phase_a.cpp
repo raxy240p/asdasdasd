@@ -23,7 +23,9 @@
 
 #include <windows.h>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 extern "C" ipc::Block g_ipc;
@@ -145,6 +147,53 @@ using FnSetAttr = void(__fastcall*)(void* /*CAttributeList*/,
 FnSetAttr g_setAttr      = nullptr;
 FnSetAttr g_setAttrGated = nullptr;
 
+// ---- knife-swap function pointers (cs2-sdk.com flow) ----
+// All go through client.dll call gates so the outbound RIP lands inside
+// client.dll's .text. A null here means the sig missed on this build and
+// that step is quietly skipped — Knife paint still works, the model swap
+// doesn't.
+using FnApplyEconCustomization   = void(__fastcall*)(void* /*weapon*/, int /*=1*/);
+using FnUpdateCompositeMaterialSet = void(__fastcall*)(void* /*weapon*/, int /*=1*/);
+using FnInvalidateDescription    = void(__fastcall*)(void* /*itemView*/);
+using FnEconItemViewUpdate       = void(__fastcall*)(void* /*itemView*/);
+FnApplyEconCustomization    g_applyEconGated          = nullptr;
+FnUpdateCompositeMaterialSet g_updateCompositeSetGated = nullptr;
+FnInvalidateDescription     g_invalidateDescGated     = nullptr;
+FnEconItemViewUpdate        g_econItemViewUpdateGated = nullptr;
+
+// MurmurHash2 (seed 0x31415926) over the lowercase decimal def-index — this
+// is what CS2 uses for CUtlStringToken-based subclass selection. Writing
+// the result to m_nSubclassID on the weapon entity is step 3 of the knife
+// changer spec. Standard Austin-Appleby MurmurHash2 — no modifications.
+std::uint32_t MurmurHash2(const void* key, int len, std::uint32_t seed) {
+    constexpr std::uint32_t m = 0x5bd1e995;
+    constexpr int r = 24;
+    std::uint32_t h = seed ^ static_cast<std::uint32_t>(len);
+    auto* data = static_cast<const std::uint8_t*>(key);
+    while (len >= 4) {
+        std::uint32_t k;
+        std::memcpy(&k, data, 4);
+        k *= m; k ^= k >> r; k *= m;
+        h *= m; h ^= k;
+        data += 4; len -= 4;
+    }
+    switch (len) {
+        case 3: h ^= std::uint32_t(data[2]) << 16; [[fallthrough]];
+        case 2: h ^= std::uint32_t(data[1]) << 8;  [[fallthrough]];
+        case 1: h ^= std::uint32_t(data[0]); h *= m;
+    }
+    h ^= h >> 13; h *= m; h ^= h >> 15;
+    return h;
+}
+
+std::uint32_t SubclassHashForDef(std::uint16_t def) {
+    char buf[16];
+    const int n = std::snprintf(buf, sizeof(buf), "%u",
+                                static_cast<unsigned>(def));
+    if (n <= 0) return 0;
+    return MurmurHash2(buf, n, 0x31415926);
+}
+
 // Compact byte-pattern scanner. "48 89 5C 24 ? ..." style, '?' = wildcard byte.
 // Walks only readable + executable sections of the module; discarded or
 // uncommitted regions are skipped via VirtualQuery before touching them so
@@ -223,6 +272,41 @@ void ResolveAttrFn() {
     g_setAttr      = reinterpret_cast<FnSetAttr>(fn);
     g_setAttrGated = reinterpret_cast<FnSetAttr>(
         cheat::opsec::MakeGateToClient(reinterpret_cast<void*>(fn)));
+}
+
+// Resolve all knife-swap + refresh functions once. Each miss leaves its
+// gate null and that specific step gets skipped at call time. Called from
+// the first ApplyAll; results cached across the session.
+void ResolveKnifeFns() {
+    static std::atomic<bool> resolved{ false };
+    bool expected = false;
+    if (!resolved.compare_exchange_strong(expected, true)) return;
+    auto resolve = [](const char* sig) -> void* {
+        auto* fn = SigScan(Client(), sig);
+        return fn ? cheat::opsec::MakeGateToClient(fn) : nullptr;
+    };
+    g_applyEconGated           = reinterpret_cast<FnApplyEconCustomization>(
+        resolve(sigs::SIG_ApplyEconCustomization));
+    g_updateCompositeSetGated  = reinterpret_cast<FnUpdateCompositeMaterialSet>(
+        resolve(sigs::SIG_UpdateCompositeMaterialSet));
+    g_invalidateDescGated      = reinterpret_cast<FnInvalidateDescription>(
+        resolve(sigs::SIG_InvalidateDescription));
+    g_econItemViewUpdateGated  = reinterpret_cast<FnEconItemViewUpdate>(
+        resolve(sigs::SIG_EconItemView_Update));
+    // Diagnostic bits so the Settings tab shows which legs of the knife
+    // flow are offline on this build.
+    constexpr std::uint32_t kBitApplyEcon  = (1u << 11);
+    constexpr std::uint32_t kBitComposite  = (1u << 12);
+    constexpr std::uint32_t kBitInvalidate = (1u << 13);
+    constexpr std::uint32_t kBitViewUpdate = (1u << 14);
+    auto bit = [](bool have, std::uint32_t b) {
+        if (have) g_ipc.degraded_mask &= ~b;
+        else      g_ipc.degraded_mask |=  b;
+    };
+    bit(g_applyEconGated,          kBitApplyEcon);
+    bit(g_updateCompositeSetGated, kBitComposite);
+    bit(g_invalidateDescGated,     kBitInvalidate);
+    bit(g_econItemViewUpdateGated, kBitViewUpdate);
 }
 
 // Sanity-check that a Vec* really looks like Source2 CUtlVector / the
@@ -350,12 +434,57 @@ bool ApplyToView(void* view, const cheat::items::ItemConfig& it) {
     if (offsets::m_flFallbackWear)
         *At<float>(view, offsets::m_flFallbackWear) = it.wear;
 
-    return ApplyAttributes(view, it);
-    // The real refresh fn (CEconItemView::Update) is build-specific and not
-    // resolved per-build here. CS2's tick-driven CEconEntity::OnDataChanged
-    // picks up our m_iItemIDHigh=-1 + attribute writes on the next frame
-    // without any explicit poke needed. Previously we toggled m_bInitialized
-    // here, but that was cosmetic — the field doesn't drive re-materialize.
+    const bool attrsOk = ApplyAttributes(view, it);
+    // Same-frame refresh when the sig is resolved; otherwise CS2's tick-
+    // driven OnDataChanged picks the writes up on the following frame
+    // (slightly stale first-frame paint, but functionally correct).
+    if (g_econItemViewUpdateGated) g_econItemViewUpdateGated(view);
+    return attrsOk;
+}
+
+// Per-weapon memory of the knife def we last swapped TO. Lets us detect
+// when the game has rebuilt the weapon over us (def no longer matches, or
+// weapon pointer never seen) and re-fire the rebuild. Keyed by weapon
+// pointer — stale entries are harmless, the compare still fails.
+std::unordered_map<void*, std::uint16_t> g_lastKnifeDef;
+
+// Full knife MODEL swap (cs2-sdk.com flow, steps 2-6):
+//  1. m_iItemDefinitionIndex = target def (already written in ApplyToView)
+//  2. m_iEntityQuality = 3 (already written)
+//  3. m_nSubclassID = MurmurHash2(def_decimal, 0x31415926) ON THE WEAPON
+//  4. ApplyEconCustomization(weapon, 1) — queue econ reload
+//  5. UpdateCompositeMaterialSet(weapon, 1) — regenerate skin
+//  6. InvalidateDescription(view) — refresh HUD name
+// User spec step 7: only re-fire when the game has rebuilt over us, else
+// the asynchronous rebuild gets cancelled.
+void MaybeKnifeSwap(void* weapon, void* view, const cheat::items::ItemConfig& it) {
+    if (it.category != cheat::items::Category::Knife) return;
+    if (!IsKnifeDef(it.definitionIndex))              return;
+
+    auto it_cache = g_lastKnifeDef.find(weapon);
+    if (it_cache != g_lastKnifeDef.end() && it_cache->second == it.definitionIndex) {
+        // Live def still matches what we last swapped to — the rebuild is
+        // either in flight or already finished. Don't re-fire.
+        if (offsets::m_iItemDefinitionIndex) {
+            const std::uint16_t live =
+                *At<std::uint16_t>(view, offsets::m_iItemDefinitionIndex);
+            if (live == it.definitionIndex) return;
+        }
+    }
+
+    // Step 3: subclass hash on the WEAPON (C_BaseEntity), not the view.
+    if (offsets::m_nSubclassID) {
+        *At<std::uint32_t>(weapon, offsets::m_nSubclassID) =
+            SubclassHashForDef(it.definitionIndex);
+    }
+    // Step 4: queue econ reload.
+    if (g_applyEconGated) g_applyEconGated(weapon, 1);
+    // Step 5: regenerate the skin.
+    if (g_updateCompositeSetGated) g_updateCompositeSetGated(weapon, 1);
+    // Step 6: HUD name refresh.
+    if (g_invalidateDescGated) g_invalidateDescGated(view);
+
+    g_lastKnifeDef[weapon] = it.definitionIndex;
 }
 
 // Known paintable knife def-indexes. Lets a Knife config apply to whatever
@@ -391,6 +520,7 @@ class PhaseA final : public IInventoryBackend {
 public:
     bool ApplyAll(const std::vector<cheat::items::ItemConfig>& items) override {
         ResolveAttrFn();
+        ResolveKnifeFns();
 
         auto* controller = LocalController();     if (!controller) return false;
         auto* pawn       = LocalPawn(controller); if (!pawn)       return false;
@@ -412,6 +542,10 @@ public:
                 const auto* cfg = PickForDef(items, def);
                 if (!cfg) continue;
                 ApplyToView(view, *cfg);
+                // Full knife model+subclass+composite rebuild — paint alone
+                // keeps the server-spawned model, so this is what makes the
+                // Karambit visible when the player bought a Bayonet.
+                MaybeKnifeSwap(weapon, view, *cfg);
             }
         }
 
