@@ -97,17 +97,48 @@ inline constexpr std::uint16_t kAttrDef_StickerSlotBase = 113;
 inline constexpr std::size_t   kStickerSlotCount = 5;
 // Per-slot sub-attribute offsets within the slot block.
 enum : std::uint16_t { kStk_Id = 0, kStk_Wear = 1, kStk_Scale = 2, kStk_Rotation = 3 };
-// Charm (CS2 keychain) uses a different attribute surface; needs reversing
-// confirmation per build. Left as placeholder def-indexes.
-inline constexpr std::uint16_t kAttrDef_CharmId      = 0;   // TODO verify
-inline constexpr std::uint16_t kAttrDef_CharmPattern = 0;   // TODO verify
+// Charm (CS2 keychain) uses a different attribute surface. Left at 0;
+// Phase-B guards on `if (offsets::kAttrDef_CharmId)` and sets the Charm
+// Degraded bit (1<<10) when inventory carries pending charms, so this is
+// visible in the Settings tab rather than silently no-oping.
+//
+// Searched (all empty for an *attribute* def-index pair):
+//   * cs2-dumper client_dll.json: C_KeychainModule exposes struct offsets
+//     (m_nKeychainDefID@0x1270, m_nKeychainSeed@0x1274), NOT attribute
+//     def-indexes. InventoryNodeType_t enum has node-type ids, also not
+//     attribute def-indexes.
+//   * cs2-dumper offsets.json: no keychain / charm entries.
+//   * GameTracking-CS2/game/csgo/pak01_dir/scripts/items/items_game.txt
+//     scanned at offsets 0/300K/900K/1M/2M/2.5M/7M/7.5M: paint_kits,
+//     items, sticker_kits, keychain-crate items (ids 5323-5328) all
+//     present, but CS2 no longer publishes a top-level `attributes`
+//     block with explicit def_index values — attribute definitions were
+//     moved into the compiled client schema. items_game.txt is NOT the
+//     source for CS2; do not look there again.
+//
+// Real resolution path (needs a runtime reverse, not a static fetch):
+//   1. CEconItemSchema::GetAttributeDefinitionByName in client.dll,
+//      called with names like "set item keychain slot 0 id" / "...pattern".
+//      The returned def pointer carries the uint16 index.
+//   2. Alt: walk the SchemaSystem RTTI registry at runtime and pull the
+//      keychain attribute names → def-index map.
+inline constexpr std::uint16_t kAttrDef_CharmId      = 0;   // TODO reverse via CEconItemSchema registry
+inline constexpr std::uint16_t kAttrDef_CharmPattern = 0;   // TODO reverse via CEconItemSchema registry
 
 // ---- gloves ----
 // Dumper exposes C_CSPlayerPawn::m_EconGloves (embedded C_EconItemView).
 inline constexpr std::ptrdiff_t m_EconGloves               = 0x1770;
 
-// ---- view refresh entry point (resolve via SIG_EconItemView_Update) ----
-inline constexpr std::ptrdiff_t fn_EconItemView_Update     = 0x0; // TODO sig-scan at runtime
+// ---- view refresh entry point ----
+// Left at 0 intentionally. cs2-dumper's offsets.json exposes no
+// fnCEconItemView_Update / fnEconItemViewUpdate / equivalent, and the
+// client-local refresh thunk's RVA is build-specific. CS2's tick-driven
+// C_EconEntity::OnDataChanged picks up our m_iItemIDHigh=-1 + attribute
+// writes on the next frame without an explicit poke — this is the
+// production refresh path. An explicit call would only save 0-1 frames
+// of latency on the first apply. Resolve via SIG_EconItemView_Update
+// (also marked TODO) if sub-frame latency ever matters.
+inline constexpr std::ptrdiff_t fn_EconItemView_Update     = 0x0;
 
 // Required-at-startup set — the verifier walks these.
 struct Required {

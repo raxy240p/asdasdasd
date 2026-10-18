@@ -17,8 +17,12 @@ void DrawInventoryTab() {
         S.inventory.clear();
         cheat::inventory::RequestRevert();
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("items: %zu", S.inventory.size());
+    // Count badge right-aligned in the toolbar row, textDim via TextDisabled.
+    char badge[32];
+    std::snprintf(badge, sizeof(badge), "%zu items", S.inventory.size());
+    const float bw = ImGui::CalcTextSize(badge).x;
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - bw);
+    ImGui::TextDisabled("%s", badge);
 
     ImGui::Separator();
 

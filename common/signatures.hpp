@@ -12,9 +12,16 @@ namespace sigs {
 inline constexpr const char* PRESENT_FALLBACK           = "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC 40 48 8B D9 41 8B F8";
 inline constexpr const char* RESIZE_BUFFERS_FALLBACK    = "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC 40 41 8B F0 44 8B C2";
 
-// Client-local econ view refresh. Shape of the thunk is stable across builds;
-// re-verify first bytes after each schema change in GameTracking-CS2.
-inline constexpr const char* SIG_EconItemView_Update    = "40 53 48 83 EC ? 48 8B D9 48 8B 49 ? 48 85 C9 74 ? E8 ? ? ? ?"; // TODO verify
+// Client-local econ view refresh. Unused by default — Phase-B relies on
+// CS2's tick-driven C_EconEntity::OnDataChanged (see fn_EconItemView_Update
+// note in offsets.hpp). Pattern below is a plausible prologue shape, not
+// confirmed against the current build; cs2-dumper does not expose this
+// function's RVA, so re-verify by disassembly before switching Phase-B to
+// an explicit refresh call.
+// TODO verify: last checked against cs2-dumper offsets.json (no entry);
+// disassemble C_EconEntity::OnOwnerDataChanged in client.dll and follow
+// the inner thunk when sub-frame latency matters.
+inline constexpr const char* SIG_EconItemView_Update    = "40 53 48 83 EC ? 48 8B D9 48 8B 49 ? 48 85 C9 74 ? E8 ? ? ? ?";
 
 // Local-player resolve helper (fallback if dwLocalPlayerController breaks).
 inline constexpr const char* SIG_GetLocalPlayerCtrl     = "48 8B 05 ? ? ? ? 48 85 C0 74 ? 48 8B 40 ? 48 85 C0 74 ? C3";

@@ -64,12 +64,18 @@ struct Vec {
 //   chunk     = *(void**)(entity_system + 0x10 + 8*(idx>>9))
 //   entity    = *(C_BaseEntity**)(chunk + 120*(idx & 0x1FF))
 //   identity  = *(CEntityIdentity**)(entity + 0x10)       // CEntityInstance::m_pEntity
-//   ehandle   = *(uint32_t*)(identity + 0x10)             // identity's own stored handle
+//   ehandle   = *(uint32_t*)(identity + 0x10)             // schema-opaque probe
 //
-// Serial check: resolved identity's ehandle MUST equal the queried handle.
-// If it doesn't but the low 15 bits (idx) match, the serial offset in the
-// identity may differ for this build — fail OPEN with just the idx-match
-// as the weaker guard. Full mismatch at idx-level = reject.
+// SCHEMA NOTE: cs2-dumper's client_dll.json does NOT name the ehandle field
+// on CEntityIdentity. Dumped fields start at m_nameStringTableIndex@0x14,
+// m_name@0x18, ... — the 0x00..0x14 window (vtable + gap) houses the handle
+// per public cs2 reversing convention, but it's unverified by the dumper.
+// So: hard-reject on idx-mismatch (always safe — slot was reused), and
+// fail-OPEN on full-handle mismatch (the serial read may be bogus on a
+// build where the field isn't at +0x10). Phase-B reads m_hMyWeapons live
+// each OnFrame, so a stale-but-idx-matching ent is self-corrected shortly.
+// TODO: upgrade to a true serial compare when cs2-dumper exposes the field
+// or someone reverses the exact offset per CS2 build.
 void* ResolveHandle(std::uint32_t handle) {
     if (handle == 0 || handle == 0xFFFFFFFFu) return nullptr;
     const int idx = static_cast<int>(handle & 0x7FFFu);
@@ -348,9 +354,17 @@ void ApplyToView(void* view, const cheat::items::ItemConfig& it) {
 }
 
 // Match live weapon's def to a user ItemConfig. First match by def_index wins.
+// Inventory-cosmetic categories (music kits, coins/pins/patches, graffiti)
+// have no per-weapon attribute injection path, so they never pick here even
+// if a def-index collision would otherwise match.
 const cheat::items::ItemConfig*
 PickForDef(const std::vector<cheat::items::ItemConfig>& items, std::uint16_t def) {
-    for (const auto& it : items) if (it.definitionIndex == def) return &it;
+    using C = cheat::items::Category;
+    for (const auto& it : items) {
+        if (it.category == C::MusicKit || it.category == C::Coin ||
+            it.category == C::Patch    || it.category == C::Graffiti) continue;
+        if (it.definitionIndex == def) return &it;
+    }
     return nullptr;
 }
 
@@ -388,6 +402,34 @@ public:
             ApplyToView(view, *cfg);
             anyApplied = true;
         }
+
+        // Gloves: m_EconGloves is an embedded C_EconItemView on the pawn,
+        // not a weapon handle. Walk the inventory for Glove entries and
+        // slam them into the glove view. Last-match wins if multiple.
+        if (offsets::m_EconGloves) {
+            auto* gloveView = At<std::uint8_t>(pawn, offsets::m_EconGloves);
+            for (const auto& it : items) {
+                if (it.category != cheat::items::Category::Glove) continue;
+                ApplyToView(gloveView, it);
+                anyApplied = true;
+            }
+        }
+
+        // Diagnostic bit 10: inventory carries charm attributes but the
+        // charm def-indexes aren't reversed yet. Recompute each apply so
+        // removing the charm clears the signal (previously stuck once set).
+        constexpr std::uint32_t kCharmDegradedBit = (1u << 10);
+        bool hasPendingCharm = false;
+        if (!offsets::kAttrDef_CharmId) {
+            for (const auto& it : items) {
+                if (it.charm.charmId != 0 || it.charm.pattern != 0) {
+                    hasPendingCharm = true; break;
+                }
+            }
+        }
+        if (hasPendingCharm) g_ipc.degraded_mask |=  kCharmDegradedBit;
+        else                 g_ipc.degraded_mask &= ~kCharmDegradedBit;
+
         return anyApplied;
     }
 
@@ -409,6 +451,11 @@ public:
             if (!view) continue;
             // ItemIDHigh = 0 lets the server-side truth re-flow on next tick.
             if (offsets::m_iItemIDHigh) *At<std::uint32_t>(view, offsets::m_iItemIDHigh) = 0;
+        }
+        // Snap gloves back too — same ItemIDHigh = 0 trick on the embedded view.
+        if (offsets::m_EconGloves && offsets::m_iItemIDHigh) {
+            auto* gloveView = At<std::uint8_t>(pawn, offsets::m_EconGloves);
+            *At<std::uint32_t>(gloveView, offsets::m_iItemIDHigh) = 0;
         }
         return true;
     }

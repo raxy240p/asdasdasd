@@ -8,7 +8,12 @@
 #include <d3d11.h>
 #include <dxgi.h>
 
+struct ImFont;
+
 namespace cheat::render {
+
+ImFont* GetHeaderFont();
+
 
 struct VTable {
     void* Present        = nullptr;

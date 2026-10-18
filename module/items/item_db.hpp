@@ -43,6 +43,10 @@ struct Db {
     std::map<std::string, Agent>          agents;
     std::map<std::string, Keylike>        cases;
     std::map<std::string, Keylike>        keys;
+    // Label-only inventory cosmetics — surfaced for UI, no backend apply.
+    std::map<std::string, Keylike>        musicKits;
+    std::map<std::string, Keylike>        coinsPinsPatches;
+    std::map<std::string, Keylike>        graffiti;
 };
 
 // Loads data/items.json. Returns an empty Db + sets !ok on failure.

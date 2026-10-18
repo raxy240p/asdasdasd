@@ -2,6 +2,7 @@
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_win32.h>
+#include <filesystem>
 
 #pragma comment(lib, "d3d11.lib")
 
@@ -14,6 +15,7 @@ ID3D11DeviceContext*    g_ctx = nullptr;
 ID3D11RenderTargetView* g_rtv = nullptr;
 IDXGISwapChain*         g_sc  = nullptr;
 bool                    g_bound = false;
+ImFont*                 g_headerFont = nullptr;
 
 void MakeRTV() {
     if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
@@ -79,10 +81,23 @@ void OnPresent_AdoptDevice(IDXGISwapChain* sc) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
+
+    // Load Segoe UI as the default; fall back to ImGui's built-in font if
+    // the system TTF isn't where we expect it (sandboxed, Wine, etc.).
+    ImGuiIO& io = ImGui::GetIO();
+    const char* kSegoe     = "C:\\Windows\\Fonts\\segoeui.ttf";
+    const char* kSegoeBold = "C:\\Windows\\Fonts\\segoeuib.ttf";
+    if (std::filesystem::exists(kSegoe)) io.Fonts->AddFontFromFileTTF(kSegoe, 16.0f);
+    else                                 io.Fonts->AddFontDefault();
+    if (std::filesystem::exists(kSegoeBold))
+        g_headerFont = io.Fonts->AddFontFromFileTTF(kSegoeBold, 15.0f);
+
     ImGui_ImplWin32_Init(desc.OutputWindow);
     ImGui_ImplDX11_Init(g_dev, g_ctx);
     g_bound = true;
 }
+
+ImFont* GetHeaderFont() { return g_headerFont; }
 
 void OnResizePre() {
     if (!g_bound) return;
