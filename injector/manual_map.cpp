@@ -586,19 +586,29 @@ Result Inject(DWORD pid,
     CloseHandle(th);
     say("thread hijack dispatched");
 
-    // Wait for ready flag via RPM on g_ipc.
+    // Wait for ready flag via RPM on g_ipc. Short-circuit on Fatal so the
+    // launcher reports the real failure (hook install broke) instead of a
+    // generic "heartbeat timeout" after the full 5s wait.
     DWORD waited = 0;
     bool ready = false;
+    std::string failReason;
     if (opts.readyFlagRva) {
         while (waited < opts.readyTimeoutMs) {
             ipc::Block b{};
             if (ReadProcessMemory(proc,
                     reinterpret_cast<LPCVOID>(remoteBase + opts.readyFlagRva),
                     &b, sizeof(b), nullptr)) {
-                if (b.magic == ipc::kMagic &&
-                    (b.state == static_cast<uint32_t>(ipc::State::Ready) ||
-                     b.state == static_cast<uint32_t>(ipc::State::Degraded))) {
-                    ready = true; break;
+                if (b.magic == ipc::kMagic) {
+                    if (b.state == static_cast<uint32_t>(ipc::State::Ready) ||
+                        b.state == static_cast<uint32_t>(ipc::State::Degraded)) {
+                        ready = true; break;
+                    }
+                    if (b.state == static_cast<uint32_t>(ipc::State::Fatal)) {
+                        failReason = "module boot reached Fatal "
+                                     "(likely InstallPresent failed — DXGI "
+                                     "prologue mismatch or vtable resolve)";
+                        break;
+                    }
                 }
             }
             Sleep(50);
@@ -632,8 +642,10 @@ Result Inject(DWORD pid,
     // race.
     CloseHandle(proc);
 
-    if (!ready && opts.readyFlagRva)
-        return { false, "ready", "module heartbeat timeout", remoteBase };
+    if (!ready && opts.readyFlagRva) {
+        if (failReason.empty()) failReason = "module heartbeat timeout";
+        return { false, "ready", failReason, remoteBase };
+    }
     return { true, "ok", "injected", remoteBase };
 }
 
