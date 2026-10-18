@@ -102,10 +102,14 @@ def main() -> int:
     ap.add_argument("--agents",   type=Path)
     ap.add_argument("--cases",    type=Path)
     ap.add_argument("--keys",     type=Path)
+    ap.add_argument("--musicKits",type=Path)
+    ap.add_argument("--coins",    type=Path, help="Coins/pins/patches dump")
+    ap.add_argument("--graffiti", type=Path)
     args = ap.parse_args()
 
     out = { "schema_version": 2, "categories": {}, "Stickers": {}, "Charms": {},
-            "Agents": {}, "Cases": {}, "Keys": {}, }
+            "Agents": {}, "Cases": {}, "Keys": {},
+            "MusicKits": {}, "CoinsPinsPatches": {}, "Graffiti": {}, }
 
     def pick(flag, default_name):
         if flag: return flag
@@ -125,6 +129,12 @@ def main() -> int:
         if p.exists(): ingest_simple(p, out["Cases"],    "def_index",  "def_index"); any_input = True
     if p := pick(args.keys,     "keys.json"):
         if p.exists(): ingest_simple(p, out["Keys"],     "def_index",  "def_index"); any_input = True
+    if p := pick(args.musicKits,"music_kits.json"):
+        if p.exists(): ingest_simple(p, out["MusicKits"],        "def_index", "def_index"); any_input = True
+    if p := pick(args.coins,    "collectibles.json"):
+        if p.exists(): ingest_simple(p, out["CoinsPinsPatches"], "def_index", "def_index"); any_input = True
+    if p := pick(args.graffiti, "graffiti.json"):
+        if p.exists(): ingest_simple(p, out["Graffiti"],         "def_index", "def_index"); any_input = True
 
     if not any_input:
         print("error: no input files found; refusing to overwrite data/items.json",

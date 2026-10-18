@@ -348,9 +348,17 @@ void ApplyToView(void* view, const cheat::items::ItemConfig& it) {
 }
 
 // Match live weapon's def to a user ItemConfig. First match by def_index wins.
+// Inventory-cosmetic categories (music kits, coins/pins/patches, graffiti)
+// have no per-weapon attribute injection path, so they never pick here even
+// if a def-index collision would otherwise match.
 const cheat::items::ItemConfig*
 PickForDef(const std::vector<cheat::items::ItemConfig>& items, std::uint16_t def) {
-    for (const auto& it : items) if (it.definitionIndex == def) return &it;
+    using C = cheat::items::Category;
+    for (const auto& it : items) {
+        if (it.category == C::MusicKit || it.category == C::Coin ||
+            it.category == C::Patch    || it.category == C::Graffiti) continue;
+        if (it.definitionIndex == def) return &it;
+    }
     return nullptr;
 }
 
@@ -388,6 +396,31 @@ public:
             ApplyToView(view, *cfg);
             anyApplied = true;
         }
+
+        // Gloves: m_EconGloves is an embedded C_EconItemView on the pawn,
+        // not a weapon handle. Walk the inventory for Glove entries and
+        // slam them into the glove view. Last-match wins if multiple.
+        if (offsets::m_EconGloves) {
+            auto* gloveView = At<std::uint8_t>(pawn, offsets::m_EconGloves);
+            for (const auto& it : items) {
+                if (it.category != cheat::items::Category::Glove) continue;
+                ApplyToView(gloveView, it);
+                anyApplied = true;
+            }
+        }
+
+        // Diagnostic: if the inventory carries any charm attributes and the
+        // charm def-indexes haven't been reversed yet, surface it in the
+        // Settings offset-status panel. Non-fatal.
+        if (!offsets::kAttrDef_CharmId) {
+            for (const auto& it : items) {
+                if (it.charm.charmId != 0 || it.charm.pattern != 0) {
+                    g_ipc.degraded_mask |= (1u << 10);
+                    break;
+                }
+            }
+        }
+
         return anyApplied;
     }
 
@@ -409,6 +442,11 @@ public:
             if (!view) continue;
             // ItemIDHigh = 0 lets the server-side truth re-flow on next tick.
             if (offsets::m_iItemIDHigh) *At<std::uint32_t>(view, offsets::m_iItemIDHigh) = 0;
+        }
+        // Snap gloves back too — same ItemIDHigh = 0 trick on the embedded view.
+        if (offsets::m_EconGloves && offsets::m_iItemIDHigh) {
+            auto* gloveView = At<std::uint8_t>(pawn, offsets::m_EconGloves);
+            *At<std::uint32_t>(gloveView, offsets::m_iItemIDHigh) = 0;
         }
         return true;
     }

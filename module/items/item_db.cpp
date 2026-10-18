@@ -68,6 +68,15 @@ LoadResult Load(const std::filesystem::path& path) {
           [](const std::string& k, const nlohmann::json& v) {
               return Keylike{ k, v.value("def_index", std::uint16_t{0}) };
           });
+    // Label-only cosmetics (music kits attach to profile, graffiti to a slot,
+    // coins/pins/patches/pets have no per-weapon attribute path). Surfaced
+    // in the DB so the UI can list them; backend ignores them.
+    auto klike = [](const std::string& k, const nlohmann::json& v) {
+        return Keylike{ k, v.value("def_index", std::uint16_t{0}) };
+    };
+    scoop("MusicKits",        db.musicKits,        klike);
+    scoop("CoinsPinsPatches", db.coinsPinsPatches, klike);
+    scoop("Graffiti",         db.graffiti,         klike);
 
     return { true, "ok", std::move(db) };
 }
