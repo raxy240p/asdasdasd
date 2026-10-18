@@ -24,6 +24,11 @@
 
 #pragma comment(lib, "d3d11.lib")
 
+// ImGui v1.91 keeps its WndProc handler declaration behind `#if 0`.
+// MUST live at GLOBAL scope (not inside anon ns) or the call site below
+// binds to a local internal-linkage name and the link fails.
+IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+
 namespace injector::ui {
 
 namespace {
@@ -67,10 +72,12 @@ bool CreateDevice(HWND h) {
     if (FAILED(hr)) return false;
 
     ID3D11Texture2D* back = nullptr;
-    g_dx.sc->GetBuffer(0, IID_PPV_ARGS(&back));
+    if (FAILED(g_dx.sc->GetBuffer(0, IID_PPV_ARGS(&back))) || !back) {
+        return false;
+    }
     g_dx.dev->CreateRenderTargetView(back, nullptr, &g_dx.rtv);
     back->Release();
-    return true;
+    return g_dx.rtv != nullptr;
 }
 
 void CleanupDevice() {
@@ -81,18 +88,22 @@ void CleanupDevice() {
     g_dx = {};
 }
 
-// ImGui v1.91 keeps the backend's WndProc handler declaration behind
-// `#if 0` — forward-declare it explicitly. C++ linkage.
-IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (ImGui_ImplWin32_WndProcHandler(h, m, w, l)) return 1;
+    if (::ImGui_ImplWin32_WndProcHandler(h, m, w, l)) return 1;
     if (m == WM_SIZE && g_dx.dev && w != SIZE_MINIMIZED) {
+        // ResizeBuffers rejects outstanding back-buffer refs AND bound views.
+        // Unbind the ctx RTV before dropping ours.
+        if (g_dx.ctx) g_dx.ctx->OMSetRenderTargets(0, nullptr, nullptr);
         if (g_dx.rtv) { g_dx.rtv->Release(); g_dx.rtv = nullptr; }
-        g_dx.sc->ResizeBuffers(0, LOWORD(l), HIWORD(l), DXGI_FORMAT_UNKNOWN, 0);
+        if (FAILED(g_dx.sc->ResizeBuffers(0, LOWORD(l), HIWORD(l),
+                                         DXGI_FORMAT_UNKNOWN, 0))) {
+            return 0; // leave rtv null; drawing path checks for it
+        }
         ID3D11Texture2D* back = nullptr;
-        g_dx.sc->GetBuffer(0, IID_PPV_ARGS(&back));
-        g_dx.dev->CreateRenderTargetView(back, nullptr, &g_dx.rtv);
-        back->Release();
+        if (SUCCEEDED(g_dx.sc->GetBuffer(0, IID_PPV_ARGS(&back))) && back) {
+            g_dx.dev->CreateRenderTargetView(back, nullptr, &g_dx.rtv);
+            back->Release();
+        }
         return 0;
     }
     if (m == WM_DESTROY) { PostQuitMessage(0); return 0; }
@@ -337,24 +348,84 @@ int Run(HINSTANCE hInst) {
                 S.stage = Stage::Fail; S.failMsg = "cheat.dll missing next to loader";
                 LogLine(S.failMsg.c_str());
             } else {
+                // Resolve g_ipc's RVA from the DLL bytes so the mapper can
+                // wait for the module to flip to Ready/Degraded before we
+                // report success. Previously set to 0, which meant the
+                // launcher reported "injected ok" without any confirmation
+                // the module had even reached the Present hook.
+                std::uint64_t ipcRva = 0;
+                {
+                    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(bytes.data());
+                    if (bytes.size() > sizeof(IMAGE_DOS_HEADER) &&
+                        dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(
+                            bytes.data() + dos->e_lfanew);
+                        if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                            auto& dir = nt->OptionalHeader
+                                .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+                            if (dir.VirtualAddress && dir.Size) {
+                                // Walk exports locally for g_ipc.
+                                auto* sec = IMAGE_FIRST_SECTION(nt);
+                                auto rva2off = [&](DWORD rva) -> DWORD {
+                                    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+                                        if (rva >= sec[i].VirtualAddress &&
+                                            rva <  sec[i].VirtualAddress + sec[i].Misc.VirtualSize)
+                                            return rva - sec[i].VirtualAddress + sec[i].PointerToRawData;
+                                    return 0;
+                                };
+                                DWORD edOff = rva2off(dir.VirtualAddress);
+                                if (edOff && edOff + sizeof(IMAGE_EXPORT_DIRECTORY) <= bytes.size()) {
+                                    auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(
+                                        bytes.data() + edOff);
+                                    DWORD namesOff = rva2off(ed->AddressOfNames);
+                                    DWORD ordsOff  = rva2off(ed->AddressOfNameOrdinals);
+                                    DWORD funcsOff = rva2off(ed->AddressOfFunctions);
+                                    if (namesOff && ordsOff && funcsOff) {
+                                        auto* names = reinterpret_cast<DWORD*>(bytes.data() + namesOff);
+                                        auto* ords  = reinterpret_cast<WORD*>(bytes.data() + ordsOff);
+                                        auto* funcs = reinterpret_cast<DWORD*>(bytes.data() + funcsOff);
+                                        for (DWORD i = 0; i < ed->NumberOfNames; ++i) {
+                                            DWORD nOff = rva2off(names[i]);
+                                            if (!nOff) continue;
+                                            auto* n = reinterpret_cast<const char*>(bytes.data() + nOff);
+                                            if (std::strcmp(n, "g_ipc") == 0) {
+                                                ipcRva = funcs[ords[i]];
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
 #ifdef SK_MODULE_STOMP
                 LogLine("stomp mapping...");
                 injector::stomp::Options opts;
-                opts.readyFlagRva = 0;
+                opts.readyFlagRva = ipcRva;
                 auto r = injector::stomp::InjectStomp(S.cs2->pid, bytes, opts, &LogLine);
 #else
                 LogLine("manual mapping...");
                 mapper::Options opts;
-                opts.readyFlagRva = 0;
+                opts.readyFlagRva = ipcRva;
                 auto r = mapper::Inject(S.cs2->pid, bytes, opts, &LogLine);
 #endif
                 if (r.ok) {
                     LogLine("injected ok");
-                    // Grab a SYNCHRONIZE handle to watch for cs2 exit. If it
-                    // fails we still succeed the inject — just no auto-clean.
+                    // SYNCHRONIZE handle for exit-watch. If OpenProcess fails,
+                    // the inject still succeeded — stay in Watching, surface
+                    // a note instead of flipping to Fail (previously a Fail
+                    // here would re-enable INJECT and attempt a second map
+                    // over the live module).
                     S.watchHandle = OpenProcess(SYNCHRONIZE, FALSE, S.cs2->pid);
-                    S.stage = S.watchHandle ? Stage::Watching : Stage::Fail;
-                    if (!S.watchHandle) { S.failMsg = "no SYNCHRONIZE on cs2 (can't auto-clean)"; }
+                    if (S.watchHandle) {
+                        S.stage = Stage::Watching;
+                    } else {
+                        S.stage = Stage::Watching;
+                        S.failMsg = "injected ok (no SYNCHRONIZE: no auto-clean)";
+                        LogLine(S.failMsg.c_str());
+                    }
                 } else {
                     S.stage = Stage::Fail; S.failMsg = r.stage + ": " + r.message;
                     LogLine(S.failMsg.c_str());

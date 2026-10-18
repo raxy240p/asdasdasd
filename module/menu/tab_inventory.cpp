@@ -62,8 +62,8 @@ void DrawInventoryTab() {
             ImGui::PushID(i);
             if (ImGui::SmallButton("edit")) {
                 S.editing      = it;
+                S.editingIdx   = i;        // commit updates in place
                 S.editorOpen   = true;
-                // Editor only renders inside the Add Item tab — jump there.
                 S.requestedTab = "Add Item";
             }
             ImGui::SameLine();
@@ -72,7 +72,21 @@ void DrawInventoryTab() {
         }
         if (removeIdx >= 0) {
             S.inventory.erase(S.inventory.begin() + removeIdx);
+            // Restore the server-truth values on all live views so the
+            // removed entry's attributes stop being overridden, then re-
+            // apply what's left. Order matters: ClearAll first wipes our
+            // override marker (m_iItemIDHigh=0 lets CS2 reload), then
+            // dirty=true repaints the remaining inventory on next frame.
+            cheat::inventory::RequestRevert();
             S.dirty = true;
+            // If the row being removed was the one in the editor, clear
+            // the edit cursor so the Add tab's commit goes back to append.
+            if (S.editingIdx == removeIdx) {
+                S.editingIdx = -1;
+                S.editorOpen = false;
+            } else if (S.editingIdx > removeIdx) {
+                --S.editingIdx;
+            }
         }
         ImGui::EndTable();
     }

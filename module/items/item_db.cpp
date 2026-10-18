@@ -12,6 +12,10 @@ LoadResult Load(const std::filesystem::path& path) {
     try { f >> j; }
     catch (const std::exception& e) { return { false, e.what(), {} }; }
 
+    // Shape-conversion exceptions (type_error from mis-shaped nodes) must
+    // not escape — the menu would propagate them into Boot() and the module
+    // would die before Present ever ran. Catch here, bubble a clean error.
+    try {
     Db db;
     db.schemaVersion = j.value("schema_version", 0);
 
@@ -79,6 +83,9 @@ LoadResult Load(const std::filesystem::path& path) {
     scoop("Graffiti",         db.graffiti,         klike);
 
     return { true, "ok", std::move(db) };
+    } catch (const std::exception& e) {
+        return { false, std::string("items.json shape error: ") + e.what(), {} };
+    }
 }
 
 unsigned int RarityColor(const std::string& r) {

@@ -25,6 +25,10 @@ struct State {
     // Editor state (when a paint is picked)
     cheat::items::ItemConfig  editing{};
     bool                      editorOpen = false;
+    // -1 means "committing adds a new entry"; >=0 means "committing updates
+    // this inventory index". Set when the user clicks Edit on an existing
+    // row so the commit button overwrites instead of duplicating.
+    int                       editingIdx = -1;
 
     // Settings
     int         toggleVk = VK_INSERT;  // §4.2 Settings — rebindable

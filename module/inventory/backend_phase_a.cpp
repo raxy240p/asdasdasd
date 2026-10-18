@@ -265,60 +265,65 @@ bool UpdateExistingAttr(void* attrList, std::uint16_t defIdx, float value) {
     return false;
 }
 
-void SetAttr(void* attrList, std::uint16_t defIdx, float value) {
-    if (!attrList) return;
-    // In-place first — works on existing attributes and doesn't need the
-    // resolved function pointer. This covers the common case.
-    if (UpdateExistingAttr(attrList, defIdx, value)) return;
-    // Append path needs the real fn (append grows the vector + fixes up
-    // network state handler). VAC rule: gated pointer only, never raw.
-    if (!g_setAttrGated) return;
+// Returns true if the attribute was written (in-place or via append).
+bool SetAttr(void* attrList, std::uint16_t defIdx, float value) {
+    if (!attrList) return false;
+    if (UpdateExistingAttr(attrList, defIdx, value)) return true;
+    if (!g_setAttrGated) return false;    // caller signals Degraded
     g_setAttrGated(attrList, defIdx, value);
+    return true;
 }
 
 float Bits(std::uint32_t u) {
     float f; std::memcpy(&f, &u, 4); return f;
 }
 
-// Push ItemConfig attributes into a CAttributeList through
-// SetOrAddAttributeValueByName. Values that the attribute system expects
-// as integer-coerced floats go through the memcpy helper.
-void ApplyAttributes(void* view, const cheat::items::ItemConfig& it) {
+// Returns true if every attribute write succeeded. False means some
+// writes needed the append path and we had no resolved gate — caller
+// surfaces Degraded instead of claiming success.
+bool ApplyAttributes(void* view, const cheat::items::ItemConfig& it) {
     void* attrList = At<std::uint8_t>(view, offsets::m_AttributeList);
+    bool allOk = true;
 
-    // Paint / wear / seed / stattrak (CSGO legacy numbering carried over).
-    SetAttr(attrList, offsets::kAttrDef_PaintKit,
-            Bits(static_cast<std::uint32_t>(it.paintKit)));
-    SetAttr(attrList, offsets::kAttrDef_Wear, it.wear);
-    SetAttr(attrList, offsets::kAttrDef_Seed,
-            Bits(static_cast<std::uint32_t>(it.seed)));
+    allOk &= SetAttr(attrList, offsets::kAttrDef_PaintKit,
+                     Bits(static_cast<std::uint32_t>(it.paintKit)));
+    allOk &= SetAttr(attrList, offsets::kAttrDef_Wear, it.wear);
+    allOk &= SetAttr(attrList, offsets::kAttrDef_Seed,
+                     Bits(static_cast<std::uint32_t>(it.seed)));
     if (it.statTrak >= 0) {
-        SetAttr(attrList, offsets::kAttrDef_StatTrak,
-                Bits(static_cast<std::uint32_t>(it.statTrak)));
-        SetAttr(attrList, offsets::kAttrDef_StatTrakType, Bits(0));
+        allOk &= SetAttr(attrList, offsets::kAttrDef_StatTrak,
+                         Bits(static_cast<std::uint32_t>(it.statTrak)));
+        allOk &= SetAttr(attrList, offsets::kAttrDef_StatTrakType, Bits(0));
+    } else {
+        // Toggling StatTrak off must CLEAR a previously-applied counter,
+        // not just skip the write. In-place write to 0 if the attr is
+        // already present; absence means it was never set, nothing to do.
+        UpdateExistingAttr(attrList, offsets::kAttrDef_StatTrak, Bits(0));
+        UpdateExistingAttr(attrList, offsets::kAttrDef_StatTrakType, Bits(0));
     }
 
     // Sticker slot block: base + slot*4 + {id, wear, scale, rotation}.
     for (std::uint16_t s = 0; s < offsets::kStickerSlotCount; ++s) {
         const auto& sl = it.stickers[s];
         const std::uint16_t base = offsets::kAttrDef_StickerSlotBase + s * 4;
-        SetAttr(attrList, base + offsets::kStk_Id,
-                Bits(static_cast<std::uint32_t>(sl.stickerId)));
-        SetAttr(attrList, base + offsets::kStk_Wear,     sl.wear);
-        SetAttr(attrList, base + offsets::kStk_Scale,    sl.scale);
-        SetAttr(attrList, base + offsets::kStk_Rotation, sl.rotation);
+        allOk &= SetAttr(attrList, base + offsets::kStk_Id,
+                         Bits(static_cast<std::uint32_t>(sl.stickerId)));
+        allOk &= SetAttr(attrList, base + offsets::kStk_Wear,     sl.wear);
+        allOk &= SetAttr(attrList, base + offsets::kStk_Scale,    sl.scale);
+        allOk &= SetAttr(attrList, base + offsets::kStk_Rotation, sl.rotation);
     }
 
     if (offsets::kAttrDef_CharmId) {
-        SetAttr(attrList, offsets::kAttrDef_CharmId,
-                Bits(static_cast<std::uint32_t>(it.charm.charmId)));
-        SetAttr(attrList, offsets::kAttrDef_CharmPattern,
-                Bits(static_cast<std::uint32_t>(it.charm.pattern)));
+        allOk &= SetAttr(attrList, offsets::kAttrDef_CharmId,
+                         Bits(static_cast<std::uint32_t>(it.charm.charmId)));
+        allOk &= SetAttr(attrList, offsets::kAttrDef_CharmPattern,
+                         Bits(static_cast<std::uint32_t>(it.charm.pattern)));
     }
+    return allOk;
 }
 
-void ApplyToView(void* view, const cheat::items::ItemConfig& it) {
-    if (!view) return;
+bool ApplyToView(void* view, const cheat::items::ItemConfig& it) {
+    if (!view) return false;
 
     if (offsets::m_iItemDefinitionIndex)
         *At<std::uint16_t>(view, offsets::m_iItemDefinitionIndex) = it.definitionIndex;
@@ -345,7 +350,7 @@ void ApplyToView(void* view, const cheat::items::ItemConfig& it) {
     if (offsets::m_flFallbackWear)
         *At<float>(view, offsets::m_flFallbackWear) = it.wear;
 
-    ApplyAttributes(view, it);
+    return ApplyAttributes(view, it);
     // The real refresh fn (CEconItemView::Update) is build-specific and not
     // resolved per-build here. CS2's tick-driven CEconEntity::OnDataChanged
     // picks up our m_iItemIDHigh=-1 + attribute writes on the next frame
@@ -353,10 +358,20 @@ void ApplyToView(void* view, const cheat::items::ItemConfig& it) {
     // here, but that was cosmetic — the field doesn't drive re-materialize.
 }
 
-// Match live weapon's def to a user ItemConfig. First match by def_index wins.
-// Inventory-cosmetic categories (music kits, coins/pins/patches, graffiti)
-// have no per-weapon attribute injection path, so they never pick here even
-// if a def-index collision would otherwise match.
+// Known paintable knife def-indexes. Lets a Knife config apply to whatever
+// knife the user currently has equipped, instead of requiring the live
+// def-index to already equal the configured one.
+// ponytail: hard-coded range, upgrade to db-driven set if a build adds a knife.
+bool IsKnifeDef(std::uint16_t def) {
+    return def == 42 || def == 59 || (def >= 500 && def <= 526);
+}
+
+// Match live weapon's def to a user ItemConfig. Normal rule: first exact
+// def-index match wins. Knife special case: any Knife config applies to
+// any paintable knife def the player currently holds (so switching from a
+// default knife to a Karambit-painted entry works without the live def
+// already being Karambit). Inventory-cosmetic categories have no per-weapon
+// path and are skipped.
 const cheat::items::ItemConfig*
 PickForDef(const std::vector<cheat::items::ItemConfig>& items, std::uint16_t def) {
     using C = cheat::items::Category;
@@ -365,6 +380,10 @@ PickForDef(const std::vector<cheat::items::ItemConfig>& items, std::uint16_t def
             it.category == C::Patch    || it.category == C::Graffiti) continue;
         if (it.definitionIndex == def) return &it;
     }
+    if (IsKnifeDef(def)) {
+        for (const auto& it : items)
+            if (it.category == C::Knife) return &it;
+    }
     return nullptr;
 }
 
@@ -372,50 +391,42 @@ class PhaseA final : public IInventoryBackend {
 public:
     bool ApplyAll(const std::vector<cheat::items::ItemConfig>& items) override {
         ResolveAttrFn();
-        // Append path (adding attributes not already on the item) needs the
-        // real fn. In-place updates (overriding attributes already present
-        // on an already-painted weapon) work without it. Only flip to
-        // Degraded when neither will have any effect — not here.
 
         auto* controller = LocalController();     if (!controller) return false;
         auto* pawn       = LocalPawn(controller); if (!pawn)       return false;
         auto* svc        = WeaponServices(pawn);  if (!svc)        return false;
 
         Vec* myWeapons = At<Vec>(svc, offsets::m_hMyWeapons);
-        // Same plausibility fence as UpdateExistingAttr. If a future schema
-        // change moves the vector, we bail cleanly instead of iterating a
-        // bogus handle array.
-        if (!VecLooksSane(myWeapons))                       return false;
-        if (!myWeapons->memory || myWeapons->size <= 0)     return false;
+        const bool haveWeapons = VecLooksSane(myWeapons) &&
+                                 myWeapons->memory && myWeapons->size > 0;
 
-        auto* handles = static_cast<std::uint32_t*>(myWeapons->memory);
-        bool anyApplied = false;
-        for (int i = 0; i < myWeapons->size; ++i) {
-            auto* weapon = ResolveHandle(handles[i]);
-            if (!weapon) continue;
-            auto* view = ItemViewFromWeapon(weapon);
-            if (!view) continue;
+        if (haveWeapons) {
+            auto* handles = static_cast<std::uint32_t*>(myWeapons->memory);
+            for (int i = 0; i < myWeapons->size; ++i) {
+                auto* weapon = ResolveHandle(handles[i]);
+                if (!weapon) continue;
+                auto* view = ItemViewFromWeapon(weapon);
+                if (!view) continue;
 
-            std::uint16_t def = *At<std::uint16_t>(view, offsets::m_iItemDefinitionIndex);
-            const auto* cfg = PickForDef(items, def);
-            if (!cfg) continue;
-            ApplyToView(view, *cfg);
-            anyApplied = true;
+                std::uint16_t def = *At<std::uint16_t>(view, offsets::m_iItemDefinitionIndex);
+                const auto* cfg = PickForDef(items, def);
+                if (!cfg) continue;
+                ApplyToView(view, *cfg);
+            }
         }
 
-        // Gloves: m_EconGloves is an embedded C_EconItemView on the pawn,
-        // not a weapon handle. Walk the inventory for Glove entries and
-        // slam them into the glove view. Last-match wins if multiple.
+        // Gloves live on the pawn, not among the weapons. Apply even when
+        // m_hMyWeapons is empty / insane — gloves are independent of the
+        // weapon list and were previously skipped by the early return.
         if (offsets::m_EconGloves) {
             auto* gloveView = At<std::uint8_t>(pawn, offsets::m_EconGloves);
             for (const auto& it : items) {
                 if (it.category != cheat::items::Category::Glove) continue;
                 ApplyToView(gloveView, it);
-                anyApplied = true;
             }
         }
 
-        // Diagnostic bit 10: inventory carries charm attributes but the
+        // Degraded bit 10: inventory carries charm attributes but the
         // charm def-indexes aren't reversed yet. Recompute each apply so
         // removing the charm clears the signal (previously stuck once set).
         constexpr std::uint32_t kCharmDegradedBit = (1u << 10);
@@ -430,7 +441,14 @@ public:
         if (hasPendingCharm) g_ipc.degraded_mask |=  kCharmDegradedBit;
         else                 g_ipc.degraded_mask &= ~kCharmDegradedBit;
 
-        return anyApplied;
+        // "Best-effort" contract: always return true. Dirty-clear is safe
+        // because OnFrame also re-fires on WeaponSetChanged + a ~1Hz
+        // heartbeat, so inventory entries whose live weapon isn't present
+        // this frame get painted the moment the server issues them. If we
+        // instead held dirty until every entry matched, a configured skin
+        // for a weapon the player never buys would spin ApplyAll every
+        // frame forever.
+        return true;
     }
 
     bool ClearAll() override {
@@ -469,22 +487,56 @@ std::unique_ptr<IInventoryBackend> MakeBackend() {
     return std::make_unique<PhaseA>();
 }
 
+// Low-cost signature of the live weapon set: last-seen m_hMyWeapons vector
+// pointer + size. Any change triggers a re-apply so new weapons (pickup,
+// respawn, round start) get painted without the user re-clicking Apply.
+// ponytail: periodic+signature re-apply, instead of hooking every spawn.
+void* g_lastWeaponsMem = nullptr;
+int   g_lastWeaponsSize = -1;
+std::uint32_t g_frame = 0;
+
+bool WeaponSetChanged() {
+    auto* controller = LocalController();     if (!controller) return false;
+    auto* pawn       = LocalPawn(controller); if (!pawn)       return false;
+    auto* svc        = WeaponServices(pawn);  if (!svc)        return false;
+    Vec* v = At<Vec>(svc, offsets::m_hMyWeapons);
+    if (!VecLooksSane(v)) return false;
+    const bool changed = (v->memory != g_lastWeaponsMem) || (v->size != g_lastWeaponsSize);
+    g_lastWeaponsMem = v->memory;
+    g_lastWeaponsSize = v->size;
+    return changed;
+}
+
 void OnFrame() {
-    // Degraded gate: refuse to write when offsets.hpp isn't fully verified
-    // or the attribute-set fn hasn't been resolved yet. Writing with
-    // zero-valued offsets would land in random pointer-relative memory.
+    // Degraded gate: refuse to write when offsets aren't verified or we
+    // haven't resolved the module path yet.
     if (g_ipc.state != static_cast<uint32_t>(ipc::State::Ready)) return;
 
     if (!g_backend) g_backend = MakeBackend();
     auto& S = cheat::menu::Get();
+    ++g_frame;
 
-    // Peek dirty without clearing. We only clear after a successful apply so
-    // "menu flip during apply" isn't lost — the next frame reconsiders. The
-    // revert flag can clear eagerly; it's intentionally one-shot.
-    if (g_revertRequested.exchange(false)) g_backend->ClearAll();
+    // Revert is one-shot. If ClearAll fails because the pawn isn't ready
+    // (round warmup), re-arm the request so the next frame tries again
+    // instead of dropping it on the floor.
+    if (g_revertRequested.exchange(false)) {
+        if (!g_backend->ClearAll()) g_revertRequested.store(true);
+    }
 
-    if (S.dirty.load()) {
-        if (g_backend->ApplyAll(S.inventory)) S.dirty.store(false);
+    // Re-apply when:
+    //  - the user just changed inventory (dirty),
+    //  - the live weapon vector changed (respawn, pickup, drop),
+    //  - a slow heartbeat (every ~1s @ 60fps) for inventory that lands
+    //    after a weapon spawn we didn't notice (nullable fences, etc).
+    const bool heartbeat = (g_frame % 60) == 0 && !S.inventory.empty();
+    const bool shouldApply =
+        S.dirty.load() || WeaponSetChanged() || heartbeat;
+
+    if (shouldApply) {
+        const bool all = g_backend->ApplyAll(S.inventory);
+        // Clear dirty only if everything applicable landed; otherwise keep
+        // dirty so the next frame reconsiders (partial-success contract).
+        if (all) S.dirty.store(false);
     }
 }
 

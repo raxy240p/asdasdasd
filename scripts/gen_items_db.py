@@ -32,14 +32,26 @@ CAT_FROM_WEAPON_CATEGORY = {
 
 
 def _as_int(v, default=0):
-    """Coerce upstream string ids to int; keep default on anything unparseable."""
+    """Coerce upstream string ids to int; keep default on anything unparseable.
+
+    Upstream ByMykel ids are often prefixed strings like "keychain-1" or
+    "sticker-423"; strip a trailing numeric segment so those parse to the
+    def-index Valve actually uses rather than silently returning 0.
+    """
     if v is None:
         return default
     try:
         return int(v)
     except (TypeError, ValueError):
+        s = str(v).strip()
         try:
-            return int(str(v).strip() or default)
+            return int(s or default)
+        except (TypeError, ValueError):
+            pass
+        # Trailing numeric segment after a dash/underscore: "keychain-1" -> 1
+        tail = s.rsplit("-", 1)[-1].rsplit("_", 1)[-1]
+        try:
+            return int(tail)
         except (TypeError, ValueError):
             return default
 
