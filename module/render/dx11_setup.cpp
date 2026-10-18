@@ -56,6 +56,7 @@ bool ResolveSwapChainVTable(VTable& out) {
     void** vt = *reinterpret_cast<void***>(sc);
     out.Present       = vt[8];  // IDXGISwapChain::Present
     out.ResizeBuffers = vt[13]; // IDXGISwapChain::ResizeBuffers
+    out.table         = vt;     // base — used by the vtable hook installer
 
     sc->Release(); cx->Release(); dv->Release();
     DestroyWindow(tmp);

@@ -16,8 +16,9 @@ ImFont* GetHeaderFont();
 
 
 struct VTable {
-    void* Present        = nullptr;
-    void* ResizeBuffers  = nullptr;
+    void*  Present        = nullptr;   // vtable[8]
+    void*  ResizeBuffers  = nullptr;   // vtable[13]
+    void** table          = nullptr;   // base pointer to the IDXGISwapChain vtable
 };
 
 bool    ResolveSwapChainVTable(VTable& out);

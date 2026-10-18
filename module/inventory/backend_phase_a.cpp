@@ -153,12 +153,10 @@ FnSetAttr g_setAttrGated = nullptr;
 // that step is quietly skipped — Knife paint still works, the model swap
 // doesn't.
 using FnApplyEconCustomization    = void(__fastcall*)(void* /*weapon*/, int /*=1*/);
-using FnUpdateCompositeMaterial   = void(__fastcall*)(void* /*compositeSet*/);
 using FnUpdateCompositeMaterialSet = void(__fastcall*)(void* /*weapon*/, int /*=1*/);
 using FnInvalidateDescription     = void(__fastcall*)(void* /*itemView*/);
 using FnEconItemViewUpdate        = void(__fastcall*)(void* /*itemView*/);
 FnApplyEconCustomization    g_applyEconGated           = nullptr;
-FnUpdateCompositeMaterial   g_updateCompositeGated     = nullptr;
 FnUpdateCompositeMaterialSet g_updateCompositeSetGated = nullptr;
 FnInvalidateDescription     g_invalidateDescGated      = nullptr;
 FnEconItemViewUpdate        g_econItemViewUpdateGated  = nullptr;
@@ -348,10 +346,11 @@ void ResolveKnifeFns() {
         return fn ? cheat::opsec::MakeGateToClient(fn) : nullptr;
     };
 
+    (void)resolveCallRel32; // reserved for a future UpdateCompositeMaterial
+                            // revival; currently unused since step 5a was
+                            // dropped to reduce crash blast radius.
     g_applyEconGated           = reinterpret_cast<FnApplyEconCustomization>(
         resolveDirect(sigs::SIG_ApplyEconCustomization));
-    g_updateCompositeGated     = reinterpret_cast<FnUpdateCompositeMaterial>(
-        resolveCallRel32(sigs::SIG_UpdateCompositeMaterial));
     g_updateCompositeSetGated  = reinterpret_cast<FnUpdateCompositeMaterialSet>(
         resolveDirect(sigs::SIG_UpdateCompositeMaterialSet));
     g_invalidateDescGated      = reinterpret_cast<FnInvalidateDescription>(
@@ -583,26 +582,13 @@ void MaybeKnifeSwap(void* weapon, void* view, const cheat::items::ItemConfig& it
     }
     // Step 4: queue econ reload.
     if (g_applyEconGated) g_applyEconGated(weapon, 1);
-    // Step 5a: in-place composite rebuild (spec: "if the weapon already
-    // has composite materials, UpdateCompositeMaterial on its composite
-    // set"). Composite set lives at weapon+0x610 with live material count
-    // at +0x4A0 — skip when count is 0, nothing to rebuild yet. SEH-wrap
-    // the probe since the offsets are build-specific; an AV here would
-    // kill the game. On any fault we skip the in-place rebuild and let
-    // step 5b's full regen do the work.
-    constexpr std::ptrdiff_t kCompositeSetOff = 0x610;
-    constexpr std::ptrdiff_t kLiveCountOff    = 0x4A0;
-    if (g_updateCompositeGated) {
-        auto* compositeSet = At<std::uint8_t>(weapon, kCompositeSetOff);
-        __try {
-            const std::uint32_t live =
-                *reinterpret_cast<std::uint32_t*>(compositeSet + kLiveCountOff);
-            if (live != 0) g_updateCompositeGated(compositeSet);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            // skip; step 5b still runs
-        }
-    }
-    // Step 5b: full composite regen on the weapon.
+    // Step 5 (merged): full composite regen on the weapon. Previously had
+    // a step 5a that called UpdateCompositeMaterial on weapon+0x610 (the
+    // composite set) when the live-count at +0x4A0 was non-zero, but those
+    // offsets are build-specific and an in-place call with a wrong pointer
+    // can corrupt renderer state before the SEH wrapper catches anything.
+    // Step 5b's full regen covers the common path on its own; dropping 5a
+    // reduces blast radius with no visible regression.
     if (g_updateCompositeSetGated) g_updateCompositeSetGated(weapon, 1);
     // Step 6: HUD name refresh.
     if (g_invalidateDescGated) g_invalidateDescGated(view);
