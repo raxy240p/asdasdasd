@@ -493,10 +493,12 @@ mapper::Result InjectStomp(DWORD pid,
         }
     }
 
-    std::uintptr_t entry = FindExport(local.data(),
-        reinterpret_cast<const IMAGE_NT_HEADERS64*>(local.data() + img.dos->e_lfanew),
-        stompBase, "sk_init");
-    if (!entry) entry = stompBase + img.nt->OptionalHeader.AddressOfEntryPoint;
+    // Match manual_map.cpp: always enter at AddressOfEntryPoint
+    // (__DllMainCRTStartup) so CRT init + global ctors + TLS callbacks +
+    // RtlAddFunctionTable all run. sk_init stays an exported symbol for
+    // debugging but is NEVER the shim target — hitting it bypasses CRT.
+    std::uintptr_t entry = stompBase + img.nt->OptionalHeader.AddressOfEntryPoint;
+    (void)FindExport;
 
     LPVOID shimRemote = VirtualAllocEx(proc, nullptr, 0x1000,
                                        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
