@@ -66,6 +66,9 @@ void OnPresent_AdoptDevice(IDXGISwapChain* sc) {
         g_dev = nullptr;
         return;
     }
+    // AddRef so our stored g_sc doesn't dangle if the game ever drops its
+    // reference. Released alongside the device in Shutdown().
+    sc->AddRef();
     g_sc = sc;
     g_dev->GetImmediateContext(&g_ctx);
     MakeRTV();
@@ -96,6 +99,7 @@ void Shutdown() {
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     if (g_rtv) g_rtv->Release();
+    if (g_sc)  g_sc->Release();   // released the AddRef from OnPresent_AdoptDevice
     if (g_ctx) g_ctx->Release();
     if (g_dev) g_dev->Release();
     g_rtv = nullptr; g_ctx = nullptr; g_dev = nullptr; g_sc = nullptr;
