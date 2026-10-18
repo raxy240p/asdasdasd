@@ -498,7 +498,7 @@ mapper::Result InjectStomp(DWORD pid,
     // RtlAddFunctionTable all run. sk_init stays an exported symbol for
     // debugging but is NEVER the shim target — hitting it bypasses CRT.
     std::uintptr_t entry = stompBase + img.nt->OptionalHeader.AddressOfEntryPoint;
-    (void)FindExport;
+    (void)&FindExport;  // suppress unused-fn without C4551
 
     LPVOID shimRemote = VirtualAllocEx(proc, nullptr, 0x1000,
                                        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);

@@ -536,7 +536,7 @@ Result Inject(DWORD pid,
     // leaves all three undone (per audit). Keep the sk_init export only as a
     // public symbol for debugging; the shim always goes through CRT.
     std::uintptr_t entry = remoteBase + img.nt->OptionalHeader.AddressOfEntryPoint;
-    (void)FindExport; // kept available for diagnostics
+    (void)&FindExport; // suppress unused-fn warning without C4551
 
     // Allocate a tiny RX scratch for the hijack shim OUTSIDE the module.
     // Lives in cs2.exe's address space as RX. Freed after return.

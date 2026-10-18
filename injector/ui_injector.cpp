@@ -81,7 +81,9 @@ void CleanupDevice() {
     g_dx = {};
 }
 
-// Decl lives in imgui_impl_win32.h.
+// ImGui v1.91 keeps the backend's WndProc handler declaration behind
+// `#if 0` — forward-declare it explicitly. C++ linkage.
+IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 LRESULT WINAPI WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (ImGui_ImplWin32_WndProcHandler(h, m, w, l)) return 1;
     if (m == WM_SIZE && g_dx.dev && w != SIZE_MINIMIZED) {
