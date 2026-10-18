@@ -126,8 +126,14 @@ BuildRemoteModuleMap(HANDLE proc) {
                                   w.data(), e.FullDllName.Length, nullptr)) {
                 auto pos = w.find_last_of(L"\\/");
                 std::wstring base = (pos == std::wstring::npos) ? w : w.substr(pos + 1);
-                std::transform(base.begin(), base.end(), base.begin(), ::towlower);
-                std::string a(base.begin(), base.end());
+                std::transform(base.begin(), base.end(), base.begin(),
+                               [](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
+                // DLL base-names are ASCII in practice (kernel32.dll etc.) —
+                // the explicit narrow cast silences C4244 without pulling
+                // in a code-page conversion we don't need.
+                std::string a;
+                a.reserve(base.size());
+                for (wchar_t c : base) a.push_back(static_cast<char>(c & 0x7F));
                 out[a] = reinterpret_cast<std::uintptr_t>(e.DllBase);
             }
         }
@@ -233,7 +239,10 @@ bool ResolveImports(std::uint8_t* localImage, const IMAGE_NT_HEADERS64* nt,
         const char* dllName = reinterpret_cast<const char*>(localImage + imp->Name);
 
         std::string lower = dllName;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](char c) {
+                           return static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+                       });
         auto it = remoteMap.find(lower);
         const std::uintptr_t remoteBase = (it != remoteMap.end()) ? it->second : 0;
 

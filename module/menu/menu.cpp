@@ -1,11 +1,13 @@
 #include "menu.hpp"
 #include "../../common/json.hpp"
 #include "../render/dx11_setup.hpp"
+#include "../inventory/backend.hpp"
 
 #include <imgui.h>
 #include <windows.h>
 #include <cstdlib>
 #include <fstream>
+#include <system_error>
 
 namespace cheat::menu {
 
@@ -135,6 +137,7 @@ void Shutdown() {
     g_s.selPaintKit = -1;
     g_s.editing = {};
     g_s.editorOpen = false;
+    g_s.editingIdx = -1;
     g_s.toggleVk = VK_INSERT;
     g_s.showOffsetsStatus = false;
     g_s.requestedTab.clear();
@@ -205,13 +208,34 @@ void Tick() {
 }
 
 bool SaveConfig() {
-    nlohmann::json j;
-    j["items"] = g_s.inventory;
-    j["settings"]["toggleVk"] = g_s.toggleVk;
-    std::ofstream f(g_s.configDir / "config.json");
-    if (!f) return false;
-    f << j.dump(2);
-    return true;
+    // Serialize to a buffer first so a dump() exception (e.g. invalid UTF-8
+    // from a truncated multibyte customName) can't leave a half-written
+    // file behind. Then write via rename-over-temp so an interrupted write
+    // never corrupts the live config either.
+    std::string body;
+    try {
+        nlohmann::json j;
+        j["items"] = g_s.inventory;
+        j["settings"]["toggleVk"] = g_s.toggleVk;
+        body = j.dump(2);
+    } catch (...) { return false; }
+
+    const auto cfg = g_s.configDir / "config.json";
+    const auto tmp = g_s.configDir / "config.json.tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        f.write(body.data(), static_cast<std::streamsize>(body.size()));
+        f.flush();
+        if (!f) return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, cfg, ec);
+    if (ec) {
+        std::filesystem::remove(cfg, ec);
+        std::filesystem::rename(tmp, cfg, ec);
+    }
+    return !ec;
 }
 
 bool LoadConfig() {
@@ -223,6 +247,10 @@ bool LoadConfig() {
         if (j.contains("settings"))
             g_s.toggleVk = j["settings"].value("toggleVk", int{VK_INSERT});
     } catch (...) { return false; }
+    // Loaded entries must auto-apply to the live weapon views; previously
+    // we populated inventory without touching dirty, so saved skins only
+    // took effect after the user clicked Apply.
+    g_s.dirty.store(true);
     return true;
 }
 

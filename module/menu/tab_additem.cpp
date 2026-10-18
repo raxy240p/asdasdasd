@@ -83,10 +83,13 @@ void DrawWeaponList(State& S, float width) {
 
     // Non-weapon categories live in their own buckets, not db.categories.
     // Selecting a row commits an ItemConfig directly (no paint-kit step).
+    // Entering a fresh pick path also clears editingIdx so the commit
+    // button appends instead of overwriting whatever row was last Edited.
     auto commit = [&](const std::string& name, cheat::items::Category cat) {
         S.selWeapon = name;
         S.editing = {};
         S.editing.category = cat;
+        S.editingIdx = -1;
         for (auto& s : S.editing.stickers) s.scale = 1.f;
         S.editorOpen = true;
     };
@@ -145,6 +148,7 @@ void DrawWeaponList(State& S, float width) {
         if (!S.editorOpen || S.editing.category != cheat::items::Category::Custom) {
             S.editing = {};
             S.editing.category = cheat::items::Category::Custom;
+            S.editingIdx = -1;
             for (auto& s : S.editing.stickers) s.scale = 1.f;
             S.editorOpen = true;
         }
@@ -213,6 +217,7 @@ void DrawPaintList(State& S, float width) {
             ImGui::SameLine(ImGui::GetContentRegionMax().x - 70);
             if (ImGui::Button("Select", {60, 44})) {
                 S.editing = {};
+                S.editingIdx = -1;      // paint-list pick is always a fresh add
                 // Map weapon-category name → ItemConfig::category so Phase-B
                 // can route to the right apply path (gloves hit the embedded
                 // pawn+m_EconGloves view, not the m_hMyWeapons walk).
@@ -304,8 +309,17 @@ void DrawPreviewPane(State& S, float width) {
     ImGui::PushStyleColor(ImGuiCol_Button,        accent);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, accentHi);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  accentLo);
-    if (ImGui::Button("Add to Inventory", {bw, 32})) {
-        S.inventory.push_back(it);
+    const char* label = (S.editingIdx >= 0 &&
+                         S.editingIdx < static_cast<int>(S.inventory.size()))
+                        ? "Update Entry" : "Add to Inventory";
+    if (ImGui::Button(label, {bw, 32})) {
+        if (S.editingIdx >= 0 &&
+            S.editingIdx < static_cast<int>(S.inventory.size())) {
+            S.inventory[S.editingIdx] = it;
+        } else {
+            S.inventory.push_back(it);
+        }
+        S.editingIdx = -1;
         S.dirty = true;
         S.editorOpen = false;
     }

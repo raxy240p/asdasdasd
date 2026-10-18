@@ -19,7 +19,10 @@ ID3D11ShaderResourceView* IconCache::Get(const std::string& key) {
     auto it = cache_.find(key);
     if (it != cache_.end()) return it->second;
     auto* srv = Load(key);
-    cache_.emplace(key, srv);
+    // Only cache a successful load. If the PNG is missing right now (icon
+    // pack still staging) a later Get() will retry instead of returning a
+    // permanent null.
+    if (srv) cache_.emplace(key, srv);
     return srv;
 }
 

@@ -96,8 +96,19 @@ HRESULT WINAPI PresentDetour(IDXGISwapChain* sc, UINT sync, UINT flags) {
         auto* ctx = cheat::render::GameContext();
         auto* rtv = cheat::render::MainRtv();
         if (ctx && rtv) {
+            // Save game's prior RTV + DSV so our OMSet doesn't clobber the
+            // binding ImGui will restore (ImGui's state backup inside
+            // RenderDrawData only sees whatever is bound at call time).
+            ID3D11RenderTargetView* prevRtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+            ID3D11DepthStencilView* prevDsv = nullptr;
+            ctx->OMGetRenderTargets(
+                D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, prevRtv, &prevDsv);
             ctx->OMSetRenderTargets(1, &rtv, nullptr);
             ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+            ctx->OMSetRenderTargets(
+                D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, prevRtv, prevDsv);
+            for (auto* v : prevRtv) if (v) v->Release();
+            if (prevDsv) prevDsv->Release();
         }
     }
 
@@ -157,15 +168,35 @@ bool InstallPresent() {
         return false;
     }
 
+    // Validate the stolen prologue matches the known DXGI pattern
+    // `48 89 5C 24 08` (mov [rsp+8], rbx) before copying. Any mismatch
+    // would mean mid-instruction split on the stolen-byte path and a crash
+    // first time the trampoline is called.
+    constexpr std::uint8_t kDxgiPrologue[5] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
+    auto prologueOk = [](void* target) {
+        return std::memcmp(target, kDxgiPrologue, kPatchLen) == 0;
+    };
+    if (!prologueOk(vt.Present) || !prologueOk(vt.ResizeBuffers)) {
+        VirtualFree(presentTramp, 0, MEM_RELEASE);
+        VirtualFree(resizeTramp,  0, MEM_RELEASE);
+        return false;
+    }
+
     g_origPresent = reinterpret_cast<PresentFn>(presentTramp);
     g_origResize  = reinterpret_cast<ResizeBuffersFn>(resizeTramp);
 
-    Install("Present", vt.Present,
+    const bool okP = Install("Present", vt.Present,
             std::vector<std::uint8_t>(presentPatch, presentPatch + kPatchLen),
             presentTramp);
-    Install("ResizeBuffers", vt.ResizeBuffers,
+    const bool okR = Install("ResizeBuffers", vt.ResizeBuffers,
             std::vector<std::uint8_t>(resizePatch, resizePatch + kPatchLen),
             resizeTramp);
+    if (!okP || !okR) {
+        UninstallAll();              // restore anything that did arm
+        g_origPresent = nullptr;
+        g_origResize  = nullptr;
+        return false;
+    }
     return true;
 }
 
