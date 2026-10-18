@@ -152,14 +152,16 @@ FnSetAttr g_setAttrGated = nullptr;
 // client.dll's .text. A null here means the sig missed on this build and
 // that step is quietly skipped — Knife paint still works, the model swap
 // doesn't.
-using FnApplyEconCustomization   = void(__fastcall*)(void* /*weapon*/, int /*=1*/);
+using FnApplyEconCustomization    = void(__fastcall*)(void* /*weapon*/, int /*=1*/);
+using FnUpdateCompositeMaterial   = void(__fastcall*)(void* /*compositeSet*/);
 using FnUpdateCompositeMaterialSet = void(__fastcall*)(void* /*weapon*/, int /*=1*/);
-using FnInvalidateDescription    = void(__fastcall*)(void* /*itemView*/);
-using FnEconItemViewUpdate       = void(__fastcall*)(void* /*itemView*/);
-FnApplyEconCustomization    g_applyEconGated          = nullptr;
+using FnInvalidateDescription     = void(__fastcall*)(void* /*itemView*/);
+using FnEconItemViewUpdate        = void(__fastcall*)(void* /*itemView*/);
+FnApplyEconCustomization    g_applyEconGated           = nullptr;
+FnUpdateCompositeMaterial   g_updateCompositeGated     = nullptr;
 FnUpdateCompositeMaterialSet g_updateCompositeSetGated = nullptr;
-FnInvalidateDescription     g_invalidateDescGated     = nullptr;
-FnEconItemViewUpdate        g_econItemViewUpdateGated = nullptr;
+FnInvalidateDescription     g_invalidateDescGated      = nullptr;
+FnEconItemViewUpdate        g_econItemViewUpdateGated  = nullptr;
 
 // MurmurHash2 (seed 0x31415926) over the lowercase decimal def-index — this
 // is what CS2 uses for CUtlStringToken-based subclass selection. Writing
@@ -192,6 +194,17 @@ std::uint32_t SubclassHashForDef(std::uint16_t def) {
                                 static_cast<unsigned>(def));
     if (n <= 0) return 0;
     return MurmurHash2(buf, n, 0x31415926);
+}
+
+// Resolve the function reached by a `CALL rel32` sitting at `callSite`.
+// Reads the signed 32-bit displacement at callSite+1 and adds it to
+// callSite+5. Returns null if callSite isn't an E8 call opcode (prevents
+// resolving on a mispaired signature by accident).
+std::uint8_t* ResolveCallRel32(std::uint8_t* callSite) {
+    if (!callSite || *callSite != 0xE8) return nullptr;
+    std::int32_t rel;
+    std::memcpy(&rel, callSite + 1, 4);
+    return callSite + 5 + rel;
 }
 
 // Compact byte-pattern scanner. "48 89 5C 24 ? ..." style, '?' = wildcard byte.
@@ -274,6 +287,39 @@ void ResolveAttrFn() {
         cheat::opsec::MakeGateToClient(reinterpret_cast<void*>(fn)));
 }
 
+// Runtime-resolved keychain/charm def-indexes. Replaces offsets.hpp
+// compile-time constants (which stay at 0 as a last-resort fallback) once
+// GetAttributeDefinitionByName comes back live at boot. Zero means "not
+// resolved on this build" — the apply path skips the write.
+std::uint16_t g_charmIdDef      = 0;
+std::uint16_t g_charmPatternDef = 0;
+
+using FnGetAttrDef = void*(__fastcall*)(const char* /*name*/);
+
+// Probe one attribute name via GetAttributeDefinitionByName and extract its
+// uint16 def-index. Wrapped in SEH __try so a mis-signed function (or wrong
+// calling convention) can't crash the module; a bad call just reports 0 and
+// the degraded-mask bit stays lit.
+std::uint16_t ProbeAttrDef(FnGetAttrDef fn, const char* name) {
+    if (!fn || !name) return 0;
+    void* def = nullptr;
+    __try {
+        def = fn(name);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    if (!def || reinterpret_cast<std::uintptr_t>(def) < 0x10000) return 0;
+    // CEconItemAttributeDefinition::m_nDefIndex is at offset 0 on CS2.
+    // The AV wrap catches a layout break too.
+    std::uint16_t idx = 0;
+    __try {
+        idx = *reinterpret_cast<std::uint16_t*>(def);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return idx;
+}
+
 // Resolve all knife-swap + refresh functions once. Each miss leaves its
 // gate null and that specific step gets skipped at call time. Called from
 // the first ApplyAll; results cached across the session.
@@ -281,24 +327,59 @@ void ResolveKnifeFns() {
     static std::atomic<bool> resolved{ false };
     bool expected = false;
     if (!resolved.compare_exchange_strong(expected, true)) return;
-    auto resolve = [](const char* sig) -> void* {
+    auto resolveDirect = [](const char* sig) -> void* {
         auto* fn = SigScan(Client(), sig);
         return fn ? cheat::opsec::MakeGateToClient(fn) : nullptr;
     };
+    // UpdateCompositeMaterial's sig matches a CALL SITE (starts with E8),
+    // not a function prologue — the real function is reached by resolving
+    // the rel32 displacement at the match. Gated after that resolution.
+    auto resolveCallRel32 = [](const char* sig) -> void* {
+        auto* callSite = SigScan(Client(), sig);
+        auto* fn = ResolveCallRel32(callSite);
+        return fn ? cheat::opsec::MakeGateToClient(fn) : nullptr;
+    };
+
     g_applyEconGated           = reinterpret_cast<FnApplyEconCustomization>(
-        resolve(sigs::SIG_ApplyEconCustomization));
+        resolveDirect(sigs::SIG_ApplyEconCustomization));
+    g_updateCompositeGated     = reinterpret_cast<FnUpdateCompositeMaterial>(
+        resolveCallRel32(sigs::SIG_UpdateCompositeMaterial));
     g_updateCompositeSetGated  = reinterpret_cast<FnUpdateCompositeMaterialSet>(
-        resolve(sigs::SIG_UpdateCompositeMaterialSet));
+        resolveDirect(sigs::SIG_UpdateCompositeMaterialSet));
     g_invalidateDescGated      = reinterpret_cast<FnInvalidateDescription>(
-        resolve(sigs::SIG_InvalidateDescription));
+        resolveDirect(sigs::SIG_InvalidateDescription));
     g_econItemViewUpdateGated  = reinterpret_cast<FnEconItemViewUpdate>(
-        resolve(sigs::SIG_EconItemView_Update));
+        resolveDirect(sigs::SIG_EconItemView_Update));
+
+    // Charm def-indexes via CEconItemSchema::GetAttributeDefinitionByName.
+    // Assumes the function takes just the name (CS2 publishes it as a
+    // __fastcall-looking method but the first non-this access is rcx=name
+    // on the dumped build — if that's wrong the SEH wrapper catches it).
+    auto* getAttrDef = reinterpret_cast<FnGetAttrDef>(
+        resolveDirect(sigs::SIG_GetAttributeDefinitionByName));
+    if (getAttrDef) {
+        // Two name variants seen across builds. First hit wins per field.
+        static const char* kNamesId[] = {
+            "set item keychain slot 0 id",
+            "keychain slot 0 id",
+        };
+        static const char* kNamesSeed[] = {
+            "set item keychain slot 0 pattern",
+            "set item keychain slot 0 seed",
+            "keychain slot 0 pattern",
+            "keychain slot 0 seed",
+        };
+        for (auto* n : kNamesId)   if ((g_charmIdDef     = ProbeAttrDef(getAttrDef, n))) break;
+        for (auto* n : kNamesSeed) if ((g_charmPatternDef = ProbeAttrDef(getAttrDef, n))) break;
+    }
+
     // Diagnostic bits so the Settings tab shows which legs of the knife
     // flow are offline on this build.
     constexpr std::uint32_t kBitApplyEcon  = (1u << 11);
     constexpr std::uint32_t kBitComposite  = (1u << 12);
     constexpr std::uint32_t kBitInvalidate = (1u << 13);
     constexpr std::uint32_t kBitViewUpdate = (1u << 14);
+    constexpr std::uint32_t kBitCharm      = (1u << 10); // owns bit 10 now
     auto bit = [](bool have, std::uint32_t b) {
         if (have) g_ipc.degraded_mask &= ~b;
         else      g_ipc.degraded_mask |=  b;
@@ -307,6 +388,7 @@ void ResolveKnifeFns() {
     bit(g_updateCompositeSetGated, kBitComposite);
     bit(g_invalidateDescGated,     kBitInvalidate);
     bit(g_econItemViewUpdateGated, kBitViewUpdate);
+    bit(g_charmIdDef != 0,         kBitCharm);
 }
 
 // Sanity-check that a Vec* really looks like Source2 CUtlVector / the
@@ -397,11 +479,20 @@ bool ApplyAttributes(void* view, const cheat::items::ItemConfig& it) {
         allOk &= SetAttr(attrList, base + offsets::kStk_Rotation, sl.rotation);
     }
 
-    if (offsets::kAttrDef_CharmId) {
-        allOk &= SetAttr(attrList, offsets::kAttrDef_CharmId,
+    // Charm def-indexes: prefer the runtime-resolved pair from
+    // GetAttributeDefinitionByName; fall back to the compile-time offsets
+    // only if those still hold a non-zero value (none do on current CS2).
+    const std::uint16_t charmIdDef =
+        g_charmIdDef ? g_charmIdDef : offsets::kAttrDef_CharmId;
+    const std::uint16_t charmPatDef =
+        g_charmPatternDef ? g_charmPatternDef : offsets::kAttrDef_CharmPattern;
+    if (charmIdDef) {
+        allOk &= SetAttr(attrList, charmIdDef,
                          Bits(static_cast<std::uint32_t>(it.charm.charmId)));
-        allOk &= SetAttr(attrList, offsets::kAttrDef_CharmPattern,
-                         Bits(static_cast<std::uint32_t>(it.charm.pattern)));
+        if (charmPatDef) {
+            allOk &= SetAttr(attrList, charmPatDef,
+                             Bits(static_cast<std::uint32_t>(it.charm.pattern)));
+        }
     }
     return allOk;
 }
@@ -479,7 +570,19 @@ void MaybeKnifeSwap(void* weapon, void* view, const cheat::items::ItemConfig& it
     }
     // Step 4: queue econ reload.
     if (g_applyEconGated) g_applyEconGated(weapon, 1);
-    // Step 5: regenerate the skin.
+    // Step 5a: in-place composite rebuild (spec: "if the weapon already
+    // has composite materials, UpdateCompositeMaterial on its composite
+    // set"). Composite set lives at weapon+0x610 with live material count
+    // at +0x4A0 — skip when count is 0, nothing to rebuild yet.
+    constexpr std::ptrdiff_t kCompositeSetOff = 0x610;
+    constexpr std::ptrdiff_t kLiveCountOff    = 0x4A0;
+    if (g_updateCompositeGated) {
+        auto* compositeSet = At<std::uint8_t>(weapon, kCompositeSetOff);
+        const std::uint32_t live =
+            *reinterpret_cast<std::uint32_t*>(compositeSet + kLiveCountOff);
+        if (live != 0) g_updateCompositeGated(compositeSet);
+    }
+    // Step 5b: full composite regen on the weapon.
     if (g_updateCompositeSetGated) g_updateCompositeSetGated(weapon, 1);
     // Step 6: HUD name refresh.
     if (g_invalidateDescGated) g_invalidateDescGated(view);

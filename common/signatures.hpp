@@ -42,6 +42,13 @@ inline constexpr const char* SIG_GetModelPath =
 inline constexpr const char* SIG_ChangeModel =
     "40 53 48 83 EC ? 48 8B D9 4C 8B C2 48 8B 0D ? ? ? ? 48 8D 54 24";
 
+// Attribute definition resolver — maps a schema attribute name ("set item
+// keychain slot 0 id" etc.) to its runtime def-index. Lets Phase-A resolve
+// charm/keychain def-indexes at boot instead of hard-coding them per build.
+// RVA 0x1127C70 on the dumped build; sig is a direct prologue match.
+inline constexpr const char* SIG_GetAttributeDefinitionByName =
+    "48 89 5C 24 10 48 89 6C 24 18 57 41 56 41 57 48 83 EC 60 48 8D 05";
+
 // ---- VAC intel (reference-only, SK_VAC_RECON) ----
 // All from Appendix A.3 / A.5 of the design doc.
 inline constexpr const char* VAC_MonitorFieldAccess             =
