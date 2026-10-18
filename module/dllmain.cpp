@@ -6,6 +6,7 @@
 // calls sk_init directly (§3.4 step 8).
 #include "../common/ipc.hpp"
 #include "hooks/present_hook.hpp"
+#include "hooks/framestage_hook.hpp"
 #include "hooks/wndproc_hook.hpp"
 #include "menu/menu.hpp"
 #include "render/dx11_setup.hpp"
@@ -51,6 +52,15 @@ void Boot() {
         g_ipc.state = static_cast<uint32_t>(ipc::State::Fatal);
         return; // no renderer host — the module stays silent, injector surfaces
     }
+    // FrameStageNotify is the inventory-apply site per spec. If its sig
+    // misses (CS2 update changed the function head), fall back to running
+    // apply from inside PresentDetour — degraded but still functional.
+    const bool fsOk = cheat::hooks::InstallFrameStageHook();
+    cheat::hooks::SetFrameStageHooked(fsOk);
+    if (!fsOk) {
+        constexpr std::uint32_t kBitFrameStage = (1u << 15);
+        g_ipc.degraded_mask |= kBitFrameStage;
+    }
 #ifdef SK_VAC_RECON
     cheat::opsec::recon::Init();
 #endif
@@ -62,10 +72,15 @@ void Teardown() {
 #ifdef SK_VAC_RECON
     cheat::opsec::recon::Shutdown();  // drain in-flight recon detours
 #endif
+    cheat::hooks::UninstallFrameStageHook();  // no-op; registry restores on UninstallAll
     cheat::hooks::UninstallPresent();
-    // Spin until the Present detour isn't mid-body. The flag is set as the
-    // first act of the detour, so this catches threads already past the jmp.
-    for (int i = 0; i < 50 && cheat::hooks::PresentInFlight(); ++i) Sleep(2);
+    // Spin until BOTH detours are quiescent. Each sets its own in-flight
+    // flag as the first act of its body, so this catches threads past the
+    // entry jmp but before the trailing stores.
+    for (int i = 0; i < 50 && (cheat::hooks::PresentInFlight() ||
+                               cheat::hooks::FrameStageInFlight()); ++i) {
+        Sleep(2);
+    }
     cheat::menu::Shutdown();
     cheat::render::Shutdown();
     cheat::opsec::UnloadAllGates();

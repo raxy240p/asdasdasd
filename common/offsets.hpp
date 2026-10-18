@@ -63,11 +63,18 @@ inline constexpr std::ptrdiff_t m_Item                     = 0x50;   // C_EconIt
 // Direct fields.
 inline constexpr std::ptrdiff_t m_iItemDefinitionIndex     = 0x1BA;
 inline constexpr std::ptrdiff_t m_iEntityQuality           = 0x1BC;
+inline constexpr std::ptrdiff_t m_iItemID                  = 0x1C8;   // uint64, client-side item marker
 inline constexpr std::ptrdiff_t m_iItemIDHigh              = 0x1D0;
 inline constexpr std::ptrdiff_t m_iItemIDLow               = 0x1D4;
 inline constexpr std::ptrdiff_t m_iAccountID               = 0x1D8;
-inline constexpr std::ptrdiff_t m_szCustomName             = 0x2F8;
 inline constexpr std::ptrdiff_t m_bInitialized             = 0x1E8;
+inline constexpr std::ptrdiff_t m_bDisallowSOC             = 0x1E9;   // stop server re-resolve
+inline constexpr std::ptrdiff_t m_szCustomName             = 0x2F8;
+
+// Client-side item marker (cs2-sdk.com). Setting this tells the game the
+// item is NOT backed by the Steam inventory, so it uses our fallback fields
+// instead of re-resolving against the Game Coordinator.
+inline constexpr std::uint64_t kClientSideItemID = 0xF000000000000010ULL;
 
 // Attribute list — paint/wear/seed/stattrak go through CAttributeList, not
 // through dead CSGO fallback fields. Pulled from cs2-dumper:
@@ -81,11 +88,19 @@ inline constexpr std::ptrdiff_t Attr_m_iAttributeDefinitionIndex = 0x30; // on C
 inline constexpr std::ptrdiff_t Attr_m_flValue                  = 0x34;
 inline constexpr std::size_t    Attr_sizeof                     = 0x38; // layout stride
 
-// CSGO fallback fields — kept for symmetry with Appendix B. All zero on CS2.
-inline constexpr std::ptrdiff_t m_nFallbackPaintKit        = 0x0;
-inline constexpr std::ptrdiff_t m_nFallbackSeed            = 0x0;
-inline constexpr std::ptrdiff_t m_flFallbackWear           = 0x0;
-inline constexpr std::ptrdiff_t m_nFallbackStatTrak        = 0x0;
+// Fallback fields DO exist on CS2 after all — cs2-sdk.com documents them
+// on C_EconEntity. Values here come from the published offset table. The
+// paint attributes still get written through SetAttribute (the HUD name
+// and rarity derive from those, not from these fallback fields), but the
+// renderer reads these on first apply before the attribute rebuild lands.
+inline constexpr std::ptrdiff_t m_nFallbackPaintKit        = 0x18A8;
+inline constexpr std::ptrdiff_t m_nFallbackSeed            = 0x18AC;
+inline constexpr std::ptrdiff_t m_flFallbackWear           = 0x18B0;
+inline constexpr std::ptrdiff_t m_nFallbackStatTrak        = 0x18B4;
+
+// Per-weapon econ reload gate — reset to -1 before firing
+// ApplyEconCustomization so the rebuild actually runs.
+inline constexpr std::ptrdiff_t m_nCustomEconReloadEventId = 0x1B24;
 
 // Attribute DEFINITION indexes (items_game.txt). CS2 kept CSGO's numbering
 // for the common fields; refresh after a schema break by cross-checking

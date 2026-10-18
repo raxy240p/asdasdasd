@@ -504,20 +504,38 @@ bool ApplyAttributes(void* view, const cheat::items::ItemConfig& it) {
     return allOk;
 }
 
-bool ApplyToView(void* view, const cheat::items::ItemConfig& it) {
+// Follows cs2-sdk.com step 2 verbatim:
+//   m_iItemID         = 0xF000000000000010 (client-side marker)
+//   m_iItemIDHigh/Low = split of that
+//   m_iAccountID      = account id (we write 0; m_bDisallowSOC stops the
+//                       game from re-resolving against the real inventory
+//                       so account id doesn't have to match reality)
+//   m_bInitialized    = true
+//   m_bDisallowSOC    = true
+// Caller passes `weapon` so we can write fallback fields that live on
+// C_EconEntity (the weapon itself), not on the embedded item view.
+bool ApplyToView(void* weapon, void* view, const cheat::items::ItemConfig& it) {
     if (!view) return false;
 
     if (offsets::m_iItemDefinitionIndex)
         *At<std::uint16_t>(view, offsets::m_iItemDefinitionIndex) = it.definitionIndex;
-    if (offsets::m_iItemIDHigh) {
-        // -1 marks a client-only, non-networked view (§9 note).
-        *At<std::uint32_t>(view, offsets::m_iItemIDHigh) = 0xFFFFFFFFu;
-        *At<std::uint32_t>(view, offsets::m_iItemIDLow)  = 0xFFFFFFFFu;
+
+    // Client-side identity (step 2).
+    if (offsets::m_iItemID) {
+        *At<std::uint64_t>(view, offsets::m_iItemID) = offsets::kClientSideItemID;
+        *At<std::uint32_t>(view, offsets::m_iItemIDHigh) =
+            static_cast<std::uint32_t>(offsets::kClientSideItemID >> 32);
+        *At<std::uint32_t>(view, offsets::m_iItemIDLow)  =
+            static_cast<std::uint32_t>(offsets::kClientSideItemID & 0xFFFFFFFFu);
     }
     if (offsets::m_iAccountID)
         *At<std::uint32_t>(view, offsets::m_iAccountID) = 0;
     if (offsets::m_iEntityQuality)
-        *At<std::uint32_t>(view, offsets::m_iEntityQuality) = 4; // "unusual" / high-tier
+        *At<std::uint32_t>(view, offsets::m_iEntityQuality) = 4;
+    if (offsets::m_bInitialized)
+        *At<bool>(view, offsets::m_bInitialized) = true;
+    if (offsets::m_bDisallowSOC)
+        *At<bool>(view, offsets::m_bDisallowSOC) = true;
     if (offsets::m_szCustomName) {
         auto* dst = At<char>(view, offsets::m_szCustomName);
         std::memset(dst, 0, 32);
@@ -525,17 +543,19 @@ bool ApplyToView(void* view, const cheat::items::ItemConfig& it) {
                     (std::min)(it.customName.size(), size_t{32}));
     }
 
-    // CSGO fallback fields — all 0 on CS2, guards no-op.
-    if (offsets::m_nFallbackPaintKit)
-        *At<std::uint32_t>(view, offsets::m_nFallbackPaintKit) =
-            static_cast<std::uint32_t>(it.paintKit);
-    if (offsets::m_flFallbackWear)
-        *At<float>(view, offsets::m_flFallbackWear) = it.wear;
+    // Fallback fields live on C_EconEntity (the weapon), not the view.
+    if (weapon) {
+        if (offsets::m_nFallbackPaintKit)
+            *At<std::int32_t>(weapon, offsets::m_nFallbackPaintKit) = it.paintKit;
+        if (offsets::m_nFallbackSeed)
+            *At<std::int32_t>(weapon, offsets::m_nFallbackSeed)     = it.seed;
+        if (offsets::m_flFallbackWear)
+            *At<float>(weapon, offsets::m_flFallbackWear)           = it.wear;
+        if (offsets::m_nFallbackStatTrak)
+            *At<std::int32_t>(weapon, offsets::m_nFallbackStatTrak) = it.statTrak;
+    }
 
     const bool attrsOk = ApplyAttributes(view, it);
-    // Same-frame refresh when the sig is resolved; otherwise CS2's tick-
-    // driven OnDataChanged picks the writes up on the following frame
-    // (slightly stale first-frame paint, but functionally correct).
     if (g_econItemViewUpdateGated) g_econItemViewUpdateGated(view);
     return attrsOk;
 }
@@ -579,6 +599,13 @@ void MaybeKnifeSwap(void* weapon, void* view, const cheat::items::ItemConfig& it
     if (offsets::m_nSubclassID) {
         *At<std::uint32_t>(weapon, offsets::m_nSubclassID) =
             SubclassHashForDef(it.definitionIndex);
+    }
+    // Reset the reload gate so ApplyEconCustomization actually runs its
+    // async rebuild (spec step 5: m_nCustomEconReloadEventId = -1 before
+    // the rebuild). Without this, the game sees an in-flight reload id
+    // and skips our request.
+    if (offsets::m_nCustomEconReloadEventId) {
+        *At<std::int32_t>(weapon, offsets::m_nCustomEconReloadEventId) = -1;
     }
     // Step 4: queue econ reload.
     if (g_applyEconGated) g_applyEconGated(weapon, 1);
@@ -650,7 +677,7 @@ public:
                 std::uint16_t def = *At<std::uint16_t>(view, offsets::m_iItemDefinitionIndex);
                 const auto* cfg = PickForDef(items, def);
                 if (!cfg) continue;
-                ApplyToView(view, *cfg);
+                ApplyToView(weapon, view, *cfg);
                 // Full knife model+subclass+composite rebuild — paint alone
                 // keeps the server-spawned model, so this is what makes the
                 // Karambit visible when the player bought a Bayonet.
@@ -665,7 +692,10 @@ public:
             auto* gloveView = At<std::uint8_t>(pawn, offsets::m_EconGloves);
             for (const auto& it : items) {
                 if (it.category != cheat::items::Category::Glove) continue;
-                ApplyToView(gloveView, it);
+                // Gloves don't have a separate "weapon" entity — the item
+                // view IS embedded in the pawn. Pass nullptr so ApplyToView
+                // skips the C_EconEntity-only fallback writes.
+                ApplyToView(nullptr, gloveView, it);
             }
         }
 

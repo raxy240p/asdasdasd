@@ -4,6 +4,7 @@ set(CHEAT_SOURCES
     dllmain.cpp
     hooks/hook_registry.cpp
     hooks/present_hook.cpp
+    hooks/framestage_hook.cpp
     hooks/wndproc_hook.cpp
     menu/menu.cpp
     menu/tab_inventory.cpp
