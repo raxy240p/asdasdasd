@@ -46,6 +46,12 @@ inline constexpr std::ptrdiff_t m_hMyWeapons               = 0x48;   // CUtlVect
 inline constexpr std::ptrdiff_t m_pInventory               = 0x0;
 inline constexpr std::ptrdiff_t m_vecLoadoutItems          = 0x0;
 
+// ---- schema: C_BaseEntity ----
+// m_nSubclassID selects which schema subclass drives model/anim lookup for
+// the entity. Writing a new MurmurHash2(def-index, 0x31415926) here is the
+// knife-swap mechanism; see IsKnifeDef / SubclassHash in backend_phase_a.
+inline constexpr std::ptrdiff_t m_nSubclassID              = 0x380;   // CUtlStringToken
+
 // ---- schema: C_EconEntity (every weapon derives from this) ----
 inline constexpr std::ptrdiff_t m_AttributeManager         = 0x1290; // C_AttributeContainer (embedded)
 inline constexpr std::ptrdiff_t m_hOwnerEntity             = 0x520;
@@ -128,6 +134,11 @@ inline constexpr std::uint16_t kAttrDef_CharmPattern = 0;   // TODO reverse via 
 // ---- gloves ----
 // Dumper exposes C_CSPlayerPawn::m_EconGloves (embedded C_EconItemView).
 inline constexpr std::ptrdiff_t m_EconGloves               = 0x1770;
+
+// ---- knife swap: view-model + anim graph ----
+inline constexpr std::ptrdiff_t m_hHudModelArms            = 0x1DA8; // C_CSPlayerPawn
+inline constexpr std::ptrdiff_t AnimGraph_m_nAnimationAlgorithm = 0x18;
+inline constexpr std::ptrdiff_t AnimGraph_m_sAnimGraph2Identifier = 0x440;
 
 // ---- view refresh entry point ----
 // Left at 0 intentionally. cs2-dumper's offsets.json exposes no
