@@ -264,14 +264,22 @@ bool ResolveImports(std::uint8_t* localImage, const IMAGE_NT_HEADERS64* nt,
             ULONGLONG remoteAddr = 0;
 
             if (*oft & IMAGE_ORDINAL_FLAG64) {
-                if (!local) return false;      // ordinal imports always need local
+                // Ordinal imports need BOTH the local module (for GetProcAddress)
+                // AND the remote base (so rebase translates to CS2's address).
+                // Previously we accepted local-only, which wrote the injector's
+                // address into CS2's IAT → first call jumps into our process
+                // view and crashes CS2.
+                if (!local || !remoteBase) return false;
                 FARPROC a = GetProcAddress(local, reinterpret_cast<LPCSTR>(*oft & 0xFFFF));
                 if (!a) return false;
                 remoteAddr = reinterpret_cast<ULONGLONG>(a) + rebase;
             } else {
                 auto* ib = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
                                localImage + (*oft & 0x7FFFFFFF));
-                if (local) {
+                // Local+rebase path only when BOTH available. Without
+                // remoteBase, "rebase" is zero and we'd write the injector's
+                // address into CS2's IAT — same crash as the ordinal path.
+                if (local && remoteBase) {
                     FARPROC a = GetProcAddress(local, ib->Name);
                     if (a) remoteAddr = reinterpret_cast<ULONGLONG>(a) + rebase;
                 }

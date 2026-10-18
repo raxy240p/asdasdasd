@@ -135,9 +135,23 @@ bool InstallPresent() {
     g_vtPresentSlot = &vt.table[8];
     g_vtResizeSlot  = &vt.table[13];
 
+    // Pre-assign g_origPresent / g_origResize from the current slot values
+    // BEFORE flipping the slots to our detours. If we did it the other way
+    // round, a Present call that lands in the gap would call g_origPresent
+    // while still null → crash on the first frame after INJECT. The reads
+    // here are plain non-atomic — DXGI vtables are rodata, no writers to
+    // race with. The atomic swap below is what makes the install visible
+    // to other threads.
+    g_origPresent = reinterpret_cast<PresentFn>(*g_vtPresentSlot);
+    g_origResize  = reinterpret_cast<ResizeBuffersFn>(*g_vtResizeSlot);
+
     void* prevPresent = SwapVtableSlot(g_vtPresentSlot,
                                        reinterpret_cast<void*>(&PresentDetour));
-    if (!prevPresent) { g_vtPresentSlot = g_vtResizeSlot = nullptr; return false; }
+    if (!prevPresent) {
+        g_vtPresentSlot = g_vtResizeSlot = nullptr;
+        g_origPresent = nullptr; g_origResize = nullptr;
+        return false;
+    }
 
     void* prevResize = SwapVtableSlot(g_vtResizeSlot,
                                       reinterpret_cast<void*>(&ResizeDetour));
@@ -145,9 +159,14 @@ bool InstallPresent() {
         // Roll back Present so we don't leave the game half-hooked.
         SwapVtableSlot(g_vtPresentSlot, prevPresent);
         g_vtPresentSlot = g_vtResizeSlot = nullptr;
+        g_origPresent = nullptr; g_origResize = nullptr;
         return false;
     }
 
+    // Confirm what the atomic swap handed back matches what we pre-read.
+    // Any mismatch means the slot changed between the read and the swap
+    // (e.g. a competing DXGI re-register); keep the slot's actual previous
+    // value so the tail-call lands on the right function.
     g_origPresent = reinterpret_cast<PresentFn>(prevPresent);
     g_origResize  = reinterpret_cast<ResizeBuffersFn>(prevResize);
     return true;

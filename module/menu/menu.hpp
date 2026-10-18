@@ -33,6 +33,10 @@ struct State {
     // Settings
     int         toggleVk = VK_INSERT;  // §4.2 Settings — rebindable
     bool        showOffsetsStatus = false;
+    // Knife MODEL swap (ApplyEconCustomization + composite regen). OFF by
+    // default — needs verified function sigs; a stale sig here can freeze
+    // or crash CS2. Enable only after paint-only is confirmed working.
+    bool        enableKnifeSwap = false;
 
     // Tab the UI should jump to on next frame (e.g. Inventory edit → Add Item).
     std::string requestedTab;

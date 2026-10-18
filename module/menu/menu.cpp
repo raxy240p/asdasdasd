@@ -101,7 +101,12 @@ void ApplyCleanStyle() {
 
 void Init(const std::filesystem::path& configDir) {
     g_s.configDir = configDir;
-    std::filesystem::create_directories(configDir);
+    // Non-throwing overload — an unhandled filesystem_error here would
+    // unwind out of sk_init on a thread the engine hijacked, and without
+    // RtlAddFunctionTable in our manual-map path the unwind can corrupt
+    // the game. A failed mkdir is tolerable; later writes will error.
+    std::error_code mkec;
+    std::filesystem::create_directories(configDir, mkec);
 
     auto dbPath = configDir / "items.json";
     if (!std::filesystem::exists(dbPath)) {
@@ -216,7 +221,8 @@ bool SaveConfig() {
     try {
         nlohmann::json j;
         j["items"] = g_s.inventory;
-        j["settings"]["toggleVk"] = g_s.toggleVk;
+        j["settings"]["toggleVk"]        = g_s.toggleVk;
+        j["settings"]["enableKnifeSwap"] = g_s.enableKnifeSwap;
         body = j.dump(2);
     } catch (...) { return false; }
 
@@ -244,8 +250,10 @@ bool LoadConfig() {
     try {
         nlohmann::json j; f >> j;
         if (j.contains("items")) g_s.inventory = j["items"].get<decltype(g_s.inventory)>();
-        if (j.contains("settings"))
-            g_s.toggleVk = j["settings"].value("toggleVk", int{VK_INSERT});
+        if (j.contains("settings")) {
+            g_s.toggleVk        = j["settings"].value("toggleVk", int{VK_INSERT});
+            g_s.enableKnifeSwap = j["settings"].value("enableKnifeSwap", false);
+        }
     } catch (...) { return false; }
     // Loaded entries must auto-apply to the live weapon views; previously
     // we populated inventory without touching dirty, so saved skins only
