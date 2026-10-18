@@ -3,7 +3,11 @@
 #include "../render/dx11_setup.hpp"
 
 #include <imgui.h>
-#include <imgui_impl_win32.h>   // supplies ImGui_ImplWin32_WndProcHandler
+#include <imgui_impl_win32.h>
+// ImGui v1.91 keeps the WndProc handler declaration behind `#if 0` in the
+// backend header, expecting the user to forward-declare it. The symbol has
+// C++ linkage and lives in imgui_impl_win32.cpp.
+IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 namespace cheat::hooks {
 

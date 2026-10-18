@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <atomic>
 #include <cstring>
+#include <iterator>   // std::size — MSVC 19.51 doesn't pull it transitively
 
 namespace cheat::opsec {
 
