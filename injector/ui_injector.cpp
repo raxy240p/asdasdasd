@@ -16,6 +16,7 @@
 #include <tchar.h>
 
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>

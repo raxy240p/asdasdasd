@@ -294,17 +294,25 @@ void ResolveAttrFn() {
 std::uint16_t g_charmIdDef      = 0;
 std::uint16_t g_charmPatternDef = 0;
 
-using FnGetAttrDef = void*(__fastcall*)(const char* /*name*/);
+// CEconItemSchema::GetAttributeDefinitionByName is a non-static method on
+// recent CS2 builds — rcx=this, rdx=name. We don't have the schema `this`
+// resolved (would need a second sig for g_pEconItemSchema or GetItemSchema),
+// so pass nullptr; if the function immediately uses `this` the SEH wrapper
+// catches the AV and we leave the charm bit degraded. If the function is
+// actually static-callable (loads the schema from a global in its first
+// instruction, which the prologue bytes hint at — rcx isn't homed), the
+// nullptr rcx is ignored and the lookup succeeds.
+using FnGetAttrDef = void*(__fastcall*)(void* /*this_*/, const char* /*name*/);
 
 // Probe one attribute name via GetAttributeDefinitionByName and extract its
-// uint16 def-index. Wrapped in SEH __try so a mis-signed function (or wrong
-// calling convention) can't crash the module; a bad call just reports 0 and
-// the degraded-mask bit stays lit.
+// uint16 def-index. Wrapped in SEH __try so a wrong calling convention or
+// a schema layout break can't crash the module; a bad call just reports 0
+// and the degraded-mask bit stays lit.
 std::uint16_t ProbeAttrDef(FnGetAttrDef fn, const char* name) {
     if (!fn || !name) return 0;
     void* def = nullptr;
     __try {
-        def = fn(name);
+        def = fn(nullptr, name);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
     }
