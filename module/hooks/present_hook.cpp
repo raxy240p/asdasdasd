@@ -13,6 +13,7 @@
 // Rule stays: Present is the ONLY frame-time driver. Menu render, inventory
 // apply, heartbeat, offset verify, header-erase sanity — all run here.
 #include "present_hook.hpp"
+#include "framestage_hook.hpp"
 #include "wndproc_hook.hpp"
 #include "../render/dx11_setup.hpp"
 #include "../menu/menu.hpp"
@@ -35,6 +36,10 @@ namespace {
 
 PresentFn       g_origPresent  = nullptr;
 ResizeBuffersFn g_origResize   = nullptr;
+
+// Set true by Boot() when framestage_hook installed successfully; drives
+// the fallback branch in PresentDetour.
+bool            g_frameStageHooked = false;
 
 // Vtable slot addresses we overwrote, kept so uninstall swaps the exact
 // same slots back — resolving the vtable twice could race against a DXGI
@@ -83,7 +88,16 @@ HRESULT WINAPI PresentDetour(IDXGISwapChain* sc, UINT sync, UINT flags) {
             cheat::opsec::OffsetsVerified() ? ipc::State::Ready : ipc::State::Degraded);
     }
 
-    cheat::inventory::OnFrame();
+    // Inventory apply has moved to the FrameStageNotify hook (stage
+    // FRAME_NET_UPDATE_END) per the cs2-sdk.com spec. Doing those writes
+    // here raced the game's render-side reads of the same item-view
+    // fields and was the freeze-then-crash on earlier builds. If the
+    // FrameStageNotify sig misses, framestage_hook::InstallFrameStageHook
+    // reports false and the fallback below runs apply inline — degraded
+    // but still functional. Boot sets g_frameStageHooked accordingly.
+    if (!cheat::hooks::FrameStageInFlight() && !g_frameStageHooked) {
+        cheat::inventory::OnFrame();
+    }
 
     g_inPresent.store(false);
     return g_origPresent(sc, sync, flags);
@@ -153,5 +167,7 @@ void UninstallPresent() {
 }
 
 bool PresentInFlight() { return g_inPresent.load(); }
+
+void SetFrameStageHooked(bool hooked) { g_frameStageHooked = hooked; }
 
 } // namespace cheat::hooks
