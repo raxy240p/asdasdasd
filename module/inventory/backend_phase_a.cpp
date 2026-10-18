@@ -64,12 +64,18 @@ struct Vec {
 //   chunk     = *(void**)(entity_system + 0x10 + 8*(idx>>9))
 //   entity    = *(C_BaseEntity**)(chunk + 120*(idx & 0x1FF))
 //   identity  = *(CEntityIdentity**)(entity + 0x10)       // CEntityInstance::m_pEntity
-//   ehandle   = *(uint32_t*)(identity + 0x10)             // identity's own stored handle
+//   ehandle   = *(uint32_t*)(identity + 0x10)             // schema-opaque probe
 //
-// Serial check: resolved identity's ehandle MUST equal the queried handle.
-// If it doesn't but the low 15 bits (idx) match, the serial offset in the
-// identity may differ for this build — fail OPEN with just the idx-match
-// as the weaker guard. Full mismatch at idx-level = reject.
+// SCHEMA NOTE: cs2-dumper's client_dll.json does NOT name the ehandle field
+// on CEntityIdentity. Dumped fields start at m_nameStringTableIndex@0x14,
+// m_name@0x18, ... — the 0x00..0x14 window (vtable + gap) houses the handle
+// per public cs2 reversing convention, but it's unverified by the dumper.
+// So: hard-reject on idx-mismatch (always safe — slot was reused), and
+// fail-OPEN on full-handle mismatch (the serial read may be bogus on a
+// build where the field isn't at +0x10). Phase-B reads m_hMyWeapons live
+// each OnFrame, so a stale-but-idx-matching ent is self-corrected shortly.
+// TODO: upgrade to a true serial compare when cs2-dumper exposes the field
+// or someone reverses the exact offset per CS2 build.
 void* ResolveHandle(std::uint32_t handle) {
     if (handle == 0 || handle == 0xFFFFFFFFu) return nullptr;
     const int idx = static_cast<int>(handle & 0x7FFFu);
