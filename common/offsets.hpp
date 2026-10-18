@@ -106,8 +106,16 @@ inline constexpr std::uint16_t kAttrDef_CharmPattern = 0;   // TODO verify
 // Dumper exposes C_CSPlayerPawn::m_EconGloves (embedded C_EconItemView).
 inline constexpr std::ptrdiff_t m_EconGloves               = 0x1770;
 
-// ---- view refresh entry point (resolve via SIG_EconItemView_Update) ----
-inline constexpr std::ptrdiff_t fn_EconItemView_Update     = 0x0; // TODO sig-scan at runtime
+// ---- view refresh entry point ----
+// Left at 0 intentionally. cs2-dumper's offsets.json exposes no
+// fnCEconItemView_Update / fnEconItemViewUpdate / equivalent, and the
+// client-local refresh thunk's RVA is build-specific. CS2's tick-driven
+// C_EconEntity::OnDataChanged picks up our m_iItemIDHigh=-1 + attribute
+// writes on the next frame without an explicit poke — this is the
+// production refresh path. An explicit call would only save 0-1 frames
+// of latency on the first apply. Resolve via SIG_EconItemView_Update
+// (also marked TODO) if sub-frame latency ever matters.
+inline constexpr std::ptrdiff_t fn_EconItemView_Update     = 0x0;
 
 // Required-at-startup set — the verifier walks these.
 struct Required {
